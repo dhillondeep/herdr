@@ -687,6 +687,7 @@ fn main() -> io::Result<()> {
                 "worktree",
                 "pane",
                 "session",
+                "host",
                 "integration",
             ]
             .contains(&arg.as_str())

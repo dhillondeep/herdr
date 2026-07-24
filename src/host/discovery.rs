@@ -14,12 +14,6 @@
 //! reach it. `ssh -G <name>` resolves the wildcards and reports the effective
 //! configuration offline, so it is the join between the two.
 
-// The pure candidate-gathering logic lands before the code that runs `ssh -G`
-// and renders the picker, so it has tests but no production caller yet. Kept
-// separate deliberately: this is the part worth testing exhaustively, and it is
-// testable precisely because it does no I/O.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use super::HostId;
@@ -84,6 +78,70 @@ pub fn host_names_from_ssh_config(contents: &str) -> Vec<String> {
     }
 
     names.into_iter().collect()
+}
+
+/// Wildcard `Host` patterns from ssh config, in file order.
+///
+/// [`host_names_from_ssh_config`] deliberately discards these because they are
+/// not connectable targets. They are still valuable: they describe *how* a family
+/// of machines is addressed, which is what turns a discovered bare name into
+/// something ssh can dial.
+pub fn wildcard_patterns_from_ssh_config(contents: &str) -> Vec<String> {
+    let mut patterns = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(keyword) = parts.next() else {
+            continue;
+        };
+        if !keyword.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for token in parts {
+            if token.starts_with('#') {
+                break;
+            }
+            // A lone `*` matches everything and so tells us nothing about how a
+            // name should be spelled.
+            if token == "*" || token.starts_with('!') {
+                continue;
+            }
+            if token.contains('*') && !patterns.iter().any(|existing| existing == token) {
+                patterns.push(token.to_string());
+            }
+        }
+    }
+
+    patterns
+}
+
+/// Ways a bare discovered name might be spelled as an ssh target.
+///
+/// Discovery tools report their own identifiers — a workspace manager lists
+/// `my-box`, while ssh reaches it as `prefix.my-box` because a wildcard stanza
+/// plus `ProxyCommand` is what makes it routable. Substituting the name into each
+/// single-`*` pattern from the user's own config derives the candidate spellings
+/// without hardcoding anything about any particular tool.
+///
+/// The raw name comes first: if it is already a target, that wins.
+pub fn candidate_name_forms(raw_name: &str, wildcard_patterns: &[String]) -> Vec<String> {
+    let mut forms = vec![raw_name.to_string()];
+
+    for pattern in wildcard_patterns {
+        if pattern.matches('*').count() != 1 {
+            continue;
+        }
+        let candidate = pattern.replacen('*', raw_name, 1);
+        if candidate != raw_name && !forms.contains(&candidate) {
+            forms.push(candidate);
+        }
+    }
+
+    forms
 }
 
 /// Wildcards, negations, and anything else that describes a set of hosts rather
@@ -252,6 +310,43 @@ Match host *.coder !exec \"coder connect exists %h\"
             assert!(is_pattern(token), "{token} should be treated as a pattern");
         }
         assert!(!is_pattern("plain.host"));
+    }
+
+    #[test]
+    fn wildcard_patterns_are_kept_even_though_names_are_not() {
+        let patterns = wildcard_patterns_from_ssh_config(WILDCARD_HEAVY_CONFIG);
+        assert!(patterns.contains(&"coder.*".to_string()));
+        assert!(patterns.contains(&"*.coder".to_string()));
+        assert!(
+            !patterns.contains(&"*".to_string()),
+            "a bare * says nothing about how a name is spelled"
+        );
+    }
+
+    #[test]
+    fn candidate_forms_derive_a_prefixed_spelling_from_the_users_own_config() {
+        // The case that matters: a discovery tool reports `my-box`, but ssh only
+        // reaches it as `coder.my-box` via the wildcard stanza.
+        let patterns = wildcard_patterns_from_ssh_config(WILDCARD_HEAVY_CONFIG);
+        let forms = candidate_name_forms("my-box", &patterns);
+
+        assert_eq!(forms.first().map(String::as_str), Some("my-box"));
+        assert!(
+            forms.contains(&"coder.my-box".to_string()),
+            "prefix form should be derived: {forms:?}"
+        );
+        assert!(forms.contains(&"my-box.coder".to_string()));
+    }
+
+    #[test]
+    fn candidate_forms_skip_multi_star_patterns_and_dedupe() {
+        let patterns = vec![
+            "a-*-b-*".to_string(),
+            "pre.*".to_string(),
+            "pre.*".to_string(),
+        ];
+        let forms = candidate_name_forms("box", &patterns);
+        assert_eq!(forms, vec!["box", "pre.box"]);
     }
 
     #[test]

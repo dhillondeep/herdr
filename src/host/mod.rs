@@ -5,6 +5,7 @@
 //! Public ids (`w1`, `w1:p1`, `w1:t1`) are unchanged by a host binding.
 
 pub mod discovery;
+pub mod sources;
 
 use std::fmt;
 
