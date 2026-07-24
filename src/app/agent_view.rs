@@ -193,6 +193,7 @@ fn validate_field_value(field: &AgentViewField, value: &AgentViewValue) -> Resul
                 | AgentViewBuiltinField::WorkspaceId
                 | AgentViewBuiltinField::TabId
                 | AgentViewBuiltinField::PaneId
+                | AgentViewBuiltinField::Host
                 | AgentViewBuiltinField::Agent,
             )
             | AgentViewField::Token { .. },
@@ -317,6 +318,14 @@ fn builtin_field_value(
             .map(|workspace| EvalValue::String(workspace.id.clone())),
         AgentViewBuiltinField::TabId => public_tab_id(app, entry).map(EvalValue::String),
         AgentViewBuiltinField::PaneId => public_pane_id(app, entry).map(EvalValue::String),
+        // No value for a local workspace: `host == "box1"` must not match local
+        // agents, and there is deliberately no magic "local" string that a real
+        // host could collide with.
+        AgentViewBuiltinField::Host => app
+            .workspaces
+            .get(entry.ws_idx)
+            .and_then(|workspace| workspace.host.as_ref())
+            .map(|host| EvalValue::String(host.to_string())),
         AgentViewBuiltinField::Agent => entry.agent_kind_label.clone().map(EvalValue::String),
         AgentViewBuiltinField::Seen => Some(EvalValue::Bool(entry.seen)),
         AgentViewBuiltinField::StateChangeSeq => {
@@ -371,6 +380,15 @@ fn sort_value(
                 .get(entry.ws_idx)
                 .and_then(|workspace| workspace.public_pane_number(entry.pane_id))
                 .map(|number| EvalValue::Number(number as u64)),
+            // Always yields a value so the ordering is total. Local sorts
+            // first because an empty string precedes every valid host name.
+            AgentViewBuiltinSortField::HostOrder => Some(EvalValue::String(
+                app.workspaces
+                    .get(entry.ws_idx)
+                    .and_then(|workspace| workspace.host.as_ref())
+                    .map(|host| host.to_string())
+                    .unwrap_or_default(),
+            )),
             AgentViewBuiltinSortField::Attention => Some(EvalValue::Number(u64::from(
                 super::api_helpers::tab_attention_priority(entry.state, entry.seen),
             ))),
@@ -461,6 +479,79 @@ mod tests {
             }),
             sort: Vec::new(),
         }
+    }
+
+    /// Two workspaces: `one` stays local, `two` is bound to a host.
+    fn state_with_one_remote_workspace() -> AppState {
+        let mut state = state_with_agents();
+        state.workspaces[1].host = crate::host::HostId::parse("coder.box1");
+        state
+    }
+
+    #[test]
+    fn host_filter_selects_only_agents_on_that_machine() {
+        let mut state = state_with_one_remote_workspace();
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: None,
+            filter: Some(AgentViewFilter::Eq {
+                field: AgentViewField::Builtin(AgentViewBuiltinField::Host),
+                value: AgentViewValue::String("coder.box1".to_string()),
+            }),
+            sort: Vec::new(),
+        });
+
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1, "only the remote workspace should match");
+        assert_eq!(entries[0].ws_idx, 1);
+    }
+
+    #[test]
+    fn host_filter_never_matches_a_local_workspace() {
+        // A local workspace has no host value, so there is no name — including
+        // "local" — that selects it via equality.
+        let mut state = state_with_one_remote_workspace();
+        for candidate in ["local", "", "coder.box2"] {
+            state.agent_view_override = Some(AgentViewSetParams {
+                source: "example.views".to_string(),
+                label: None,
+                filter: Some(AgentViewFilter::Eq {
+                    field: AgentViewField::Builtin(AgentViewBuiltinField::Host),
+                    value: AgentViewValue::String(candidate.to_string()),
+                }),
+                sort: Vec::new(),
+            });
+            assert!(
+                crate::ui::agent_panel_entries(&state).is_empty(),
+                "host == {candidate:?} should not match a local workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn host_order_sorts_local_agents_before_remote_ones() {
+        // Bind the FIRST workspace so a correct sort must reorder. Binding the
+        // second instead leaves the natural order unchanged, and the test would
+        // pass even if HostOrder returned a constant.
+        let mut state = state_with_agents();
+        state.workspaces[0].host = crate::host::HostId::parse("coder.box1");
+        state.agent_view_override = Some(AgentViewSetParams {
+            source: "example.views".to_string(),
+            label: None,
+            filter: None,
+            sort: vec![crate::api::schema::AgentViewSort {
+                field: AgentViewSortField::Builtin(AgentViewBuiltinSortField::HostOrder),
+                order: Default::default(),
+            }],
+        });
+
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.iter().map(|entry| entry.ws_idx).collect::<Vec<_>>(),
+            vec![1, 0],
+            "local should group first so the ordering stays total"
+        );
     }
 
     #[test]

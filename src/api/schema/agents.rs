@@ -102,6 +102,9 @@ pub enum AgentViewBuiltinField {
     WorkspaceId,
     TabId,
     PaneId,
+    /// Machine the agent's workspace is bound to. Has no value for a local
+    /// workspace, so `host == "<name>"` never matches local agents.
+    Host,
     Agent,
     Seen,
     StateChangeSeq,
@@ -143,6 +146,9 @@ pub enum AgentViewBuiltinSortField {
     WorkspaceOrder,
     TabOrder,
     PaneOrder,
+    /// Group agents by machine. Local workspaces sort first, then hosts by
+    /// name, so the ordering is total even when only some workspaces are remote.
+    HostOrder,
     Attention,
     Status,
     Agent,
@@ -183,6 +189,9 @@ pub struct AgentPromptParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     pub terminal_id: String,
+    /// Machine this agent's workspace is bound to. Absent means local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

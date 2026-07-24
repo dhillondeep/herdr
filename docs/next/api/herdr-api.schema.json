@@ -1362,29 +1362,47 @@
           "type": "object"
         },
         "AgentViewBuiltinField": {
-          "enum": [
-            "status",
-            "workspace_id",
-            "tab_id",
-            "pane_id",
-            "agent",
-            "seen",
-            "state_change_seq"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "status",
+                "workspace_id",
+                "tab_id",
+                "pane_id",
+                "agent",
+                "seen",
+                "state_change_seq"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "host",
+              "description": "Machine the agent's workspace is bound to. Has no value for a local\nworkspace, so `host == \"<name>\"` never matches local agents.",
+              "type": "string"
+            }
+          ]
         },
         "AgentViewBuiltinSortField": {
-          "enum": [
-            "workspace_order",
-            "tab_order",
-            "pane_order",
-            "attention",
-            "status",
-            "agent",
-            "seen",
-            "state_change_seq"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "workspace_order",
+                "tab_order",
+                "pane_order",
+                "attention",
+                "status",
+                "agent",
+                "seen",
+                "state_change_seq"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "host_order",
+              "description": "Group agents by machine. Local workspaces sort first, then hosts by\nname, so the ordering is total even when only some workspaces are remote.",
+              "type": "string"
+            }
+          ]
         },
         "AgentViewClearParams": {
           "properties": {
@@ -6011,6 +6029,13 @@
               "type": "boolean"
             },
             "foreground_cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "Machine this agent's workspace is bound to. Absent means local.",
               "type": [
                 "string",
                 "null"
