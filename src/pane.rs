@@ -603,7 +603,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 #[cfg(unix)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
-    child_pid: Arc<AtomicU32>,
+    child_pid: LocalPid,
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
@@ -676,7 +676,7 @@ fn spawn_basic_detection_task(
                 last_content_change_at = None;
             }
             release_was_active = suppressed_agent.is_some();
-            let pid = child_pid.load(Ordering::Acquire);
+            let pid = child_pid.raw();
             let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
@@ -959,6 +959,48 @@ impl AgentDetectionPresence {
 // PaneRuntime — PTY, parser, channels, background tasks
 // ---------------------------------------------------------------------------
 
+/// A process id belonging to **this** machine.
+///
+/// Signal escalation and the `/proc`-style process probes accept this type
+/// rather than a bare `u32`, because both act locally: `shutdown_pane_processes`
+/// calls `kill(2)` and the detection probes read local process tables. A pane
+/// whose process lives on another machine holds no `LocalPid`, so a foreign pid
+/// has no path to either — the mistake is unrepresentable rather than guarded.
+///
+/// The pid is shared and interior-mutable because it is only known after the
+/// child spawns, and background tasks observe it as it becomes available.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalPid(Arc<AtomicU32>);
+
+impl LocalPid {
+    /// A local child whose pid is not known yet. Reads as absent until published.
+    fn pending() -> Self {
+        Self(Arc::new(AtomicU32::new(0)))
+    }
+
+    /// A local process whose pid is already known.
+    fn known(pid: u32) -> Self {
+        Self(Arc::new(AtomicU32::new(pid)))
+    }
+
+    fn publish(&self, pid: u32) {
+        self.0.store(pid, Ordering::Release);
+    }
+
+    /// The pid, or `None` while it is still unknown. Zero is this codebase's
+    /// established "no pid available" signal, so it never escapes as a value.
+    fn get(&self) -> Option<u32> {
+        let pid = self.0.load(Ordering::Acquire);
+        (pid > 0).then_some(pid)
+    }
+
+    /// Raw value including the zero sentinel, for the shutdown guard and for
+    /// probes that already handle zero themselves.
+    fn raw(&self) -> u32 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
@@ -966,7 +1008,8 @@ pub struct PaneRuntime {
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
-    child_pid: Arc<AtomicU32>,
+    /// `None` for a pane whose process is not on this machine.
+    local_pid: Option<LocalPid>,
     reported_cwd: Arc<Mutex<Option<std::path::PathBuf>>>,
     child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
@@ -1125,11 +1168,15 @@ impl Drop for PaneRuntime {
         }
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
-            shutdown_pane_processes(
-                self.pane_id,
-                self.child_pid.load(Ordering::Acquire),
-                self.child_wait_completed.as_deref(),
-            );
+            // No LocalPid means the process is not on this machine; there is
+            // nothing here that may be signalled.
+            if let Some(local_pid) = &self.local_pid {
+                shutdown_pane_processes(
+                    self.pane_id,
+                    local_pid,
+                    self.child_wait_completed.as_deref(),
+                );
+            }
         }
     }
 }
@@ -1175,14 +1222,18 @@ fn wait_for_processes_to_exit_with(
     }
 }
 
+/// Tear down the pane's local process session.
+///
+/// Takes a [`LocalPid`] rather than a `u32` so a pid from another machine cannot
+/// reach `kill(2)` through this path.
 fn shutdown_pane_processes(
     pane_id: PaneId,
-    child_pid: u32,
+    local_pid: &LocalPid,
     child_wait_completed: Option<&AtomicBool>,
 ) {
     shutdown_pane_processes_with(
         pane_id,
-        child_pid,
+        local_pid.raw(),
         child_wait_completed,
         PANE_SHUTDOWN_GRACE,
         PANE_SHUTDOWN_POLL_INTERVAL,
@@ -1507,11 +1558,13 @@ impl PaneRuntime {
             handle.abort();
         }
         self.io.shutdown();
-        shutdown_pane_processes(
-            self.pane_id,
-            self.child_pid.load(Ordering::Acquire),
-            self.child_wait_completed.as_deref(),
-        );
+        if let Some(local_pid) = &self.local_pid {
+            shutdown_pane_processes(
+                self.pane_id,
+                local_pid,
+                self.child_wait_completed.as_deref(),
+            );
+        }
         self.preserve_processes_on_drop = true;
     }
 
@@ -1562,7 +1615,7 @@ impl PaneRuntime {
         &self,
         pane_id: u32,
     ) -> crate::handoff_runtime::HandoffRuntimeState {
-        let child_pid = self.child_pid.load(Ordering::Acquire);
+        let child_pid = self.local_pid.as_ref().map_or(0, LocalPid::raw);
         let (rows, cols, cell_width_px, cell_height_px) = self.current_size.get();
         crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
@@ -1806,7 +1859,7 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
-        let child_pid = Arc::new(AtomicU32::new(child_pid));
+        let child_pid = LocalPid::known(child_pid);
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -1823,7 +1876,7 @@ impl PaneRuntime {
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
             let on_read = Box::new(move |bytes: &[u8]| {
-                let shell_pid = child_pid.load(Ordering::Acquire);
+                let shell_pid = child_pid.raw();
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 observe_detection_content_change(bytes, &detection_content_seq);
@@ -1885,7 +1938,7 @@ impl PaneRuntime {
             terminal,
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
-            child_pid,
+            local_pid: Some(child_pid),
             reported_cwd,
             child_wait_completed: None,
             kitty_keyboard_flags,
@@ -1939,7 +1992,7 @@ impl PaneRuntime {
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
         // --- Child watcher task ---
-        let child_pid = Arc::new(AtomicU32::new(0));
+        let child_pid = LocalPid::pending();
         let reported_cwd = Arc::new(Mutex::new(None));
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -1951,7 +2004,7 @@ impl PaneRuntime {
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
             if let Some(pid) = child.process_id() {
-                child_pid.store(pid, Ordering::Release);
+                child_pid.publish(pid);
                 crate::logging::pane_spawned(pane_id.raw(), pid);
             }
             tokio::task::spawn_blocking(move || {
@@ -1981,7 +2034,7 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let rt = tokio::runtime::Handle::current();
             let on_read = Box::new(move |bytes: &[u8]| {
-                let shell_pid = child_pid.load(Ordering::Acquire);
+                let shell_pid = child_pid.raw();
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 if agent_detection == AgentDetection::Enabled {
@@ -2121,7 +2174,7 @@ impl PaneRuntime {
                         last_content_change_at = None;
                     }
                     release_was_active = suppressed_agent.is_some();
-                    let pid = child_pid.load(Ordering::Acquire);
+                    let pid = child_pid.raw();
                     let mut agent = agent_presence.current_agent();
                     let lifecycle_authority_active =
                         full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
@@ -2257,7 +2310,7 @@ impl PaneRuntime {
                         }
                     }
 
-                    let pid = child_pid.load(Ordering::Acquire);
+                    let pid = child_pid.raw();
                     // Keep the terminal restore side effect separate from render notification state.
                     #[allow(clippy::collapsible_if)]
                     if pid > 0 && terminal.maybe_restore_host_terminal_theme(pane_id, pid) {
@@ -2399,7 +2452,7 @@ impl PaneRuntime {
             terminal,
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
-            child_pid,
+            local_pid: Some(child_pid),
             reported_cwd,
             child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
@@ -2771,12 +2824,12 @@ impl PaneRuntime {
             return Some(cwd);
         }
 
-        let pid = self.child_pid.load(Ordering::Relaxed);
+        let pid = self.local_pid.as_ref().and_then(LocalPid::get)?;
         crate::platform::process_cwd(pid)
     }
 
     pub fn child_pid(&self) -> Option<u32> {
-        let pid = self.child_pid.load(Ordering::Acquire);
+        let pid = self.local_pid.as_ref().map_or(0, LocalPid::raw);
         (pid > 0).then_some(pid)
     }
 
@@ -2800,7 +2853,7 @@ impl PaneRuntime {
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
-            let pid = self.child_pid.load(Ordering::Acquire);
+            let pid = self.local_pid.as_ref().map_or(0, LocalPid::raw);
             let shell_cwd = usable_process_cwd(pid);
             let foreground_pgid = self
                 .io
@@ -2879,7 +2932,7 @@ impl PaneRuntime {
                     resize_tx,
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
-                child_pid: Arc::new(AtomicU32::new(0)),
+                local_pid: Some(LocalPid::pending()),
                 reported_cwd: Arc::new(Mutex::new(None)),
                 child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -3058,6 +3111,39 @@ mod tests {
             |_| true,
         );
         assert!(!never_gone);
+    }
+
+    #[test]
+    fn local_pid_hides_the_zero_sentinel() {
+        // Zero means "not known yet". It must never escape as a pid, because
+        // callers pass pids to kill(2) and to local process probes.
+        assert_eq!(LocalPid::pending().get(), None);
+        assert_eq!(LocalPid::pending().raw(), 0);
+    }
+
+    #[test]
+    fn local_pid_reports_a_known_or_published_pid() {
+        assert_eq!(LocalPid::known(42).get(), Some(42));
+
+        let pid = LocalPid::pending();
+        pid.publish(99);
+        assert_eq!(pid.get(), Some(99));
+        assert_eq!(pid.raw(), 99);
+    }
+
+    // The test runtime builder spawns a tokio task, so this needs a runtime.
+    #[tokio::test]
+    async fn a_runtime_without_a_local_pid_reports_no_child_pid() {
+        // A pane whose process is not on this machine has no LocalPid, so it
+        // must not offer a pid that local probes or kill(2) would act on.
+        // `shutdown_pane_processes` takes `&LocalPid`, so `None` also makes the
+        // shutdown path unreachable at compile time rather than at runtime.
+        let mut runtime = PaneRuntime::test_with_scrollback_bytes(80, 24, 4096, b"");
+        runtime.local_pid = None;
+        // Would otherwise attempt a local session teardown on drop.
+        runtime.preserve_processes_on_drop = false;
+
+        assert_eq!(runtime.child_pid(), None);
     }
 
     #[test]
@@ -3498,7 +3584,7 @@ mod tests {
                 resize_tx,
             },
             current_size: Cell::new((80, 24, 0, 0)),
-            child_pid: Arc::new(AtomicU32::new(0)),
+            local_pid: Some(LocalPid::pending()),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
@@ -3529,7 +3615,7 @@ mod tests {
                 resize_tx,
             },
             current_size: Cell::new((80, 24, 0, 0)),
-            child_pid: Arc::new(AtomicU32::new(0)),
+            local_pid: Some(LocalPid::pending()),
             reported_cwd: Arc::new(Mutex::new(None)),
             child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
