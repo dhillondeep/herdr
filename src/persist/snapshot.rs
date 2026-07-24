@@ -55,6 +55,10 @@ pub struct WorkspaceSnapshot {
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
+    /// Machine this workspace's processes run on. Absent means local, so old
+    /// snapshots restore as local without a version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<crate::host::HostId>,
     #[serde(default)]
     pub public_pane_numbers: HashMap<u32, usize>,
     #[serde(default)]
@@ -157,6 +161,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             id: None,
             custom_name: snap.custom_name,
             identity_cwd,
+            host: None,
             worktree_space: None,
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
@@ -286,6 +291,7 @@ fn capture_workspace(
 ) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
+        host: ws.host.clone(),
         custom_name: ws.custom_name.clone(),
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
@@ -478,6 +484,46 @@ pub(super) fn snapshot_file_version(content: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use crate::host::HostId;
+
+    #[test]
+    fn an_old_snapshot_without_host_restores_as_local() {
+        // The field is serde(default), so existing session.json files keep
+        // working without a SNAPSHOT_VERSION bump.
+        let snap: super::WorkspaceSnapshot =
+            serde_json::from_str(r#"{"identity_cwd":"/tmp","tabs":[]}"#)
+                .expect("old snapshot should still parse");
+        assert_eq!(snap.host, None);
+    }
+
+    #[test]
+    fn a_host_binding_survives_a_snapshot_round_trip() {
+        let snap: super::WorkspaceSnapshot =
+            serde_json::from_str(r#"{"identity_cwd":"/tmp","tabs":[],"host":"coder.box1"}"#)
+                .unwrap();
+        assert_eq!(snap.host.as_ref().map(HostId::as_str), Some("coder.box1"));
+
+        let again = serde_json::to_string(&snap).unwrap();
+        assert!(again.contains(r#""host":"coder.box1""#), "{again}");
+    }
+
+    #[test]
+    fn a_local_workspace_omits_host_from_its_snapshot() {
+        let snap: super::WorkspaceSnapshot =
+            serde_json::from_str(r#"{"identity_cwd":"/tmp","tabs":[]}"#).unwrap();
+        let out = serde_json::to_string(&snap).unwrap();
+        assert!(!out.contains("host"), "local workspace wrote a host: {out}");
+    }
+
+    #[test]
+    fn a_snapshot_rejects_an_unsafe_host_name() {
+        // Parsing happens on the way in, so a tampered session file cannot
+        // smuggle a shell metacharacter into a later ssh invocation.
+        assert!(serde_json::from_str::<super::WorkspaceSnapshot>(
+            r#"{"identity_cwd":"/tmp","tabs":[],"host":"box;rm -rf /"}"#
+        )
+        .is_err());
+    }
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -665,6 +711,7 @@ mod tests {
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("wproj".to_string()),
+                host: None,
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
@@ -1227,6 +1274,7 @@ mod tests {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
                 id: Some("test-ws".to_string()),
+                host: None,
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,

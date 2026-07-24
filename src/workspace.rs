@@ -157,6 +157,11 @@ pub struct Workspace {
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
+    /// Machine this workspace's processes run on. `None` is the local machine.
+    ///
+    /// A workspace is entirely local or entirely remote, so every pane in it
+    /// inherits this; there is no per-pane override.
+    pub host: Option<crate::host::HostId>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub(crate) metadata_token_sequences: HashMap<String, u64>,
     /// Public pane numbers within this workspace. Closed pane numbers are not reused.
@@ -214,6 +219,7 @@ impl Workspace {
             id,
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
+            host: None,
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_space: git_space_metadata(&identity_cwd),
@@ -397,6 +403,7 @@ impl Workspace {
                 id,
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
+                host: None,
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
                 cached_git_space: None,
@@ -1210,6 +1217,7 @@ impl Workspace {
             id: generate_workspace_id(),
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
+            host: None,
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_space: None,

@@ -1046,6 +1046,13 @@
             "focused": {
               "type": "boolean"
             },
+            "host": {
+              "description": "Machine this workspace's processes run on. Absent means local.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "label": {
               "type": "string"
             },
@@ -9681,6 +9688,13 @@
             },
             "focused": {
               "type": "boolean"
+            },
+            "host": {
+              "description": "Machine this workspace's processes run on. Absent means local.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "label": {
               "type": "string"

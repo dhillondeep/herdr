@@ -502,6 +502,7 @@ impl App {
             }),
             agent_status: pane_agent_status(agg_state, seen),
             tokens: ws.metadata_tokens.values(),
+            host: ws.host.as_ref().map(|host| host.to_string()),
             worktree: ws
                 .worktree_space()
                 .map(|space| crate::api::schema::WorkspaceWorktreeInfo {
