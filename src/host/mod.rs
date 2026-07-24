@@ -4,6 +4,8 @@
 //! is a workspace attribute rather than part of any pane or terminal identity.
 //! Public ids (`w1`, `w1:p1`, `w1:t1`) are unchanged by a host binding.
 
+pub mod discovery;
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
