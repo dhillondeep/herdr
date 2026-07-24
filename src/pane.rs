@@ -1146,30 +1146,32 @@ fn process_alive_for_shutdown(
     process_exists(pid)
 }
 
-fn wait_for_processes_to_exit(
+/// Grace period allowed after each signal before escalating.
+const PANE_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often process liveness is re-checked while waiting out a grace period.
+const PANE_SHUTDOWN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn wait_for_processes_to_exit_with(
     pids: &[u32],
     child_pid: u32,
     child_wait_completed: Option<&AtomicBool>,
     timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    process_exists: impl Fn(u32) -> bool,
 ) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let child_wait_completed =
             child_wait_completed.is_some_and(|flag| flag.load(Ordering::Acquire));
         if pids.iter().all(|pid| {
-            !process_alive_for_shutdown(
-                *pid,
-                child_pid,
-                child_wait_completed,
-                crate::platform::process_exists,
-            )
+            !process_alive_for_shutdown(*pid, child_pid, child_wait_completed, &process_exists)
         }) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(poll_interval);
     }
 }
 
@@ -1178,33 +1180,62 @@ fn shutdown_pane_processes(
     child_pid: u32,
     child_wait_completed: Option<&AtomicBool>,
 ) {
+    shutdown_pane_processes_with(
+        pane_id,
+        child_pid,
+        child_wait_completed,
+        PANE_SHUTDOWN_GRACE,
+        PANE_SHUTDOWN_POLL_INTERVAL,
+        crate::platform::session_processes,
+        crate::platform::signal_processes,
+        crate::platform::process_exists,
+    );
+}
+
+/// Signal escalation policy for tearing down a pane's process session.
+///
+/// The platform calls are injected so the escalation order, the pid-0 guard and
+/// the session-expansion fallback can be characterized without signalling real
+/// processes. `shutdown_pane_processes` binds the real ones.
+///
+/// Every pid reaching here is signalled on THIS machine, so callers must only
+/// ever pass a local pid.
+#[allow(clippy::too_many_arguments)] // injected platform seam; see doc comment
+fn shutdown_pane_processes_with(
+    pane_id: PaneId,
+    child_pid: u32,
+    child_wait_completed: Option<&AtomicBool>,
+    grace: std::time::Duration,
+    poll_interval: std::time::Duration,
+    session_processes: impl Fn(u32) -> Vec<u32>,
+    signal_processes: impl Fn(&[u32], crate::platform::Signal),
+    process_exists: impl Fn(u32) -> bool,
+) {
     if child_pid == 0 {
         return;
     }
 
-    let mut pids = crate::platform::session_processes(child_pid);
+    let mut pids = session_processes(child_pid);
     if pids.is_empty() {
         pids.push(child_pid);
     }
     pids.sort_unstable();
     pids.dedup();
 
-    for (signal, grace) in [
-        (
-            crate::platform::Signal::Hangup,
-            std::time::Duration::from_millis(250),
-        ),
-        (
-            crate::platform::Signal::Terminate,
-            std::time::Duration::from_millis(250),
-        ),
-        (
-            crate::platform::Signal::Kill,
-            std::time::Duration::from_millis(250),
-        ),
+    for signal in [
+        crate::platform::Signal::Hangup,
+        crate::platform::Signal::Terminate,
+        crate::platform::Signal::Kill,
     ] {
-        crate::platform::signal_processes(&pids, signal);
-        if wait_for_processes_to_exit(&pids, child_pid, child_wait_completed, grace) {
+        signal_processes(&pids, signal);
+        if wait_for_processes_to_exit_with(
+            &pids,
+            child_pid,
+            child_wait_completed,
+            grace,
+            poll_interval,
+            &process_exists,
+        ) {
             info!(
                 pane = pane_id.raw(),
                 pid = child_pid,
@@ -2922,6 +2953,127 @@ mod tests {
     #[test]
     fn shutdown_liveness_treats_missing_process_as_gone() {
         assert!(!process_alive_for_shutdown(43, 42, false, |_| false));
+    }
+
+    // Characterization tests for the pane session shutdown policy.
+    //
+    // These lock in the current behavior before pid ownership is made explicit,
+    // so the follow-up refactor cannot quietly change who gets signalled. Every
+    // pid reaching this policy is signalled on the local machine, which is why a
+    // remote pid must never be able to arrive here.
+
+    /// Runs the escalation policy with recorded platform calls and no real sleeps.
+    /// `alive_after` decides liveness given how many signals have been sent so far,
+    /// which is how a process "dying" on a particular signal is expressed.
+    fn run_shutdown_policy(
+        child_pid: u32,
+        session: Vec<u32>,
+        alive_after: impl Fn(usize) -> bool,
+    ) -> (Vec<crate::platform::Signal>, Vec<Vec<u32>>) {
+        let signals = std::cell::RefCell::new(Vec::new());
+        let signalled_pids = std::cell::RefCell::new(Vec::new());
+        let tiny = std::time::Duration::from_millis(0);
+
+        shutdown_pane_processes_with(
+            PaneId::from_raw(7),
+            child_pid,
+            None,
+            tiny,
+            tiny,
+            |_| session.clone(),
+            |pids, signal| {
+                signals.borrow_mut().push(signal);
+                signalled_pids.borrow_mut().push(pids.to_vec());
+            },
+            |_| alive_after(signals.borrow().len()),
+        );
+
+        (signals.into_inner(), signalled_pids.into_inner())
+    }
+
+    #[test]
+    fn shutdown_sends_nothing_when_pid_is_unknown() {
+        // pid 0 is the codebase's "no pid available" signal. Signalling on it
+        // would target the caller's own process group.
+        let (signals, _) = run_shutdown_policy(0, vec![41, 42], |_| true);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn shutdown_stops_at_hangup_when_session_exits() {
+        let (signals, _) = run_shutdown_policy(42, vec![42], |sent| sent < 1);
+        assert_eq!(signals, vec![crate::platform::Signal::Hangup]);
+    }
+
+    #[test]
+    fn shutdown_escalates_to_terminate_then_stops() {
+        let (signals, _) = run_shutdown_policy(42, vec![42], |sent| sent < 2);
+        assert_eq!(
+            signals,
+            vec![
+                crate::platform::Signal::Hangup,
+                crate::platform::Signal::Terminate
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_escalates_hangup_terminate_kill_for_a_stubborn_session() {
+        let (signals, _) = run_shutdown_policy(42, vec![42], |_| true);
+        assert_eq!(
+            signals,
+            vec![
+                crate::platform::Signal::Hangup,
+                crate::platform::Signal::Terminate,
+                crate::platform::Signal::Kill
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_falls_back_to_the_child_pid_when_the_session_is_empty() {
+        let (_, signalled) = run_shutdown_policy(42, vec![], |_| true);
+        assert_eq!(signalled.first().map(Vec::as_slice), Some([42].as_slice()));
+    }
+
+    #[test]
+    fn shutdown_signals_the_whole_session_sorted_and_deduped() {
+        let (_, signalled) = run_shutdown_policy(42, vec![44, 42, 44, 43], |_| true);
+        assert_eq!(
+            signalled.first().map(Vec::as_slice),
+            Some([42, 43, 44].as_slice())
+        );
+    }
+
+    #[test]
+    fn shutdown_waits_out_the_grace_period_before_escalating() {
+        // A process that never dies must be given every signal, and the wait
+        // helper must report failure rather than looping forever.
+        let never_gone = wait_for_processes_to_exit_with(
+            &[42],
+            42,
+            None,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+            |_| true,
+        );
+        assert!(!never_gone);
+    }
+
+    #[test]
+    fn shutdown_wait_short_circuits_on_a_reaped_direct_child() {
+        // child_wait_completed is the pid-reuse guard: once waitpid has reaped
+        // the child, liveness must not be re-probed by pid.
+        let reaped = AtomicBool::new(true);
+        let done = wait_for_processes_to_exit_with(
+            &[42],
+            42,
+            Some(&reaped),
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(1),
+            |_| true,
+        );
+        assert!(done);
     }
 
     #[cfg(unix)]
