@@ -107,15 +107,59 @@ mod client {
         Shutdown {
             channel: u64,
         },
+        // Present only to keep the variant tags aligned with the real protocol.
+        // bincode encodes an enum discriminant positionally, so a shim that omits a
+        // variant silently renumbers every one after it and this whole test file
+        // would be exercising the wrong messages.
+        #[allow(dead_code)]
+        Attach {
+            host_epoch: u64,
+            panes: Vec<(u64, u64)>,
+        },
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum FromHost {
-        Welcome { version: u32, host_epoch: u64 },
-        Spawned { channel: u64, pid: u32 },
-        SpawnFailed { channel: u64, message: String },
-        Data { channel: u64, bytes: Vec<u8> },
-        Exited { channel: u64, status: Option<i32> },
+        Welcome {
+            version: u32,
+            host_epoch: u64,
+        },
+        Spawned {
+            channel: u64,
+            pid: u32,
+        },
+        SpawnFailed {
+            channel: u64,
+            message: String,
+        },
+        Data {
+            channel: u64,
+            from: u64,
+            bytes: Vec<u8>,
+        },
+        Exited {
+            channel: u64,
+            status: Option<i32>,
+        },
+        // Same reason as `ToHost::Attach`: tags are positional, so the tail of the
+        // enum has to exist even where this test never looks at it.
+        #[allow(dead_code)]
+        Replay {
+            channel: u64,
+            from: u64,
+            bytes: Vec<u8>,
+        },
+        #[allow(dead_code)]
+        Desync {
+            channel: u64,
+            available_from: u64,
+            out_offset: u64,
+        },
+        #[allow(dead_code)]
+        Gone {
+            channel: u64,
+            reason: u8,
+        },
     }
 
     pub fn write<W: std::io::Write, M: Serialize>(
@@ -157,7 +201,7 @@ impl Bridge {
     fn spawn(argv: &[&str], rows: u16, cols: u16) -> Self {
         let (daemon, mut stdout, mut stdin) = Daemon::start();
 
-        client::write(&mut stdin, &ToHost::Hello { version: 2 }).expect("hello");
+        client::write(&mut stdin, &ToHost::Hello { version: 3 }).expect("hello");
         let welcome: FromHost = client::read(&mut stdout).expect("welcome");
         assert!(matches!(welcome, FromHost::Welcome { .. }));
 

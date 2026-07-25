@@ -331,7 +331,9 @@ fn resume_decision(
 
     let Some((bytes, start, end)) = channels.lock().ok().and_then(|map| {
         let entry = map.get(&channel)?;
-        let log = entry.log.lock().ok()?;
+        // Poison recovered, not treated as absence: reporting a live pane as `Gone`
+        // would tell the user their agent died when it is still running.
+        let log = entry.log.lock().unwrap_or_else(|err| err.into_inner());
         Some((log.since(offset), log.start, log.end))
     }) else {
         // Same epoch but no such channel: its process finished while the client was
@@ -410,14 +412,25 @@ fn spawn_channel(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         // Recorded before sending, so output produced while nobody
-                        // is attached is still replayable afterwards.
-                        if let Ok(mut log) = log.lock() {
+                        // is attached is still replayable afterwards. The offset the
+                        // log assigns is the one that goes on the wire, so the
+                        // client's idea of the stream and the log's cannot drift —
+                        // deriving the position on either side independently is how
+                        // an off-by-one becomes silent grid corruption.
+                        let from = {
+                            // Recovered rather than propagated: a poisoned log must
+                            // not stop a live pane's output, and `append` is the only
+                            // mutator so no panic can leave the offsets inconsistent.
+                            let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+                            let from = log.end;
                             log.append(&buffer[..n]);
-                        }
+                            from
+                        };
                         send(
                             &out,
                             &FromHost::Data {
                                 channel,
+                                from,
                                 bytes: buffer[..n].to_vec(),
                             },
                         );

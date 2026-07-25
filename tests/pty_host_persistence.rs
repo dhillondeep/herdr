@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod client {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 2;
+    pub const HOST_PROTOCOL_VERSION: u32 = 3;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -78,6 +78,7 @@ mod client {
         },
         Data {
             channel: u64,
+            from: u64,
             bytes: Vec<u8>,
         },
         Exited {

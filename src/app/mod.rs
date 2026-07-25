@@ -94,12 +94,14 @@ impl PaneClickState {
     }
 }
 
-/// A live connection to a host, plus the ssh process carrying it. The child is
-/// held so dropping the connection tears the transport down too.
+/// A live connection to a host.
+///
+/// The link owns its own transport and redials it, so there is no ssh handle to
+/// hold here: a dropped connection tears the transport down, and a dropped
+/// *transport* does not drop the connection.
 #[cfg(unix)]
 pub(crate) struct HostConnection {
     pub(crate) link: std::sync::Arc<crate::host::link::HostLink>,
-    _ssh: std::process::Child,
 }
 
 /// Connections, shared so a background thread can complete one without going
@@ -145,12 +147,11 @@ pub(crate) fn warm_host_connection(registry: &HostRegistry, host: crate::host::H
         };
         guard.connecting.remove(&host);
         match connected {
-            Ok((link, ssh)) => {
+            Ok(link) => {
                 guard.live.insert(
                     host,
                     HostConnection {
                         link: std::sync::Arc::new(link),
-                        _ssh: ssh,
                     },
                 );
             }
@@ -325,7 +326,7 @@ impl App {
         }
 
         match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
-            Ok((link, ssh)) => {
+            Ok(link) => {
                 let link = std::sync::Arc::new(link);
                 if let Ok(mut guard) = self.host_links.lock() {
                     guard.connecting.remove(host);
@@ -333,7 +334,6 @@ impl App {
                         host.clone(),
                         HostConnection {
                             link: std::sync::Arc::clone(&link),
-                            _ssh: ssh,
                         },
                     );
                 }

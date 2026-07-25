@@ -20,16 +20,18 @@ pub use crate::protocol::wire::FramingError;
 /// per machine and may lag, so compatibility is a *range* rather than equality —
 /// see [`negotiate`]. Exact-match versioning here would mean one stale host
 /// bricks that host until re-provisioned.
-pub const HOST_PROTOCOL_VERSION: u32 = 2;
+pub const HOST_PROTOCOL_VERSION: u32 = 3;
 
 /// Oldest host protocol this build can still talk to.
 ///
-/// Raised to 2 with session identity: the framing is positional, so a version-1
-/// daemon's `Welcome` cannot be decoded by a version-2 client. Nothing is released
-/// yet, so there is no back-compatibility to keep — and a host running the older
-/// binary now reports a clear version mismatch telling the user to re-provision,
-/// which `herdr host install` makes a one-liner.
-pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 2;
+/// Tracks `HOST_PROTOCOL_VERSION` for now: the framing is positional, so a frame
+/// from an older daemon cannot be decoded by a newer client at all — a stale peer
+/// produces a garbled `Welcome` rather than a clean refusal. Nothing is released
+/// yet, so there is no back-compatibility to keep, and a host running an older
+/// binary reports a clear version mismatch telling the user to re-provision, which
+/// `herdr host install` makes a one-liner. Once the message set settles this stops
+/// moving and the range starts doing real work.
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 3;
 
 /// Cap on a single host frame. Output is chunked well below this; the cap exists
 /// so a corrupted length prefix cannot make us allocate wildly.
@@ -134,8 +136,20 @@ pub enum FromHost {
     Spawned { channel: ChannelId, pid: u32 },
     /// A spawn failed. The channel is dead; no `Exited` will follow.
     SpawnFailed { channel: ChannelId, message: String },
-    /// PTY output.
-    Data { channel: ChannelId, bytes: Vec<u8> },
+    /// PTY output, positioned in the channel's output stream.
+    ///
+    /// `from` is the offset of the first byte, and it is not redundant with
+    /// counting received bytes locally. Answering an `Attach` is not atomic with
+    /// respect to output still being produced, so a `Replay` and a live `Data`
+    /// frame can legitimately overlap; without a position on every frame the
+    /// client cannot tell an overlap from new output and would write the same
+    /// bytes to the parser twice. It also makes a gap detectable at all rather
+    /// than silently corrupting the grid.
+    Data {
+        channel: ChannelId,
+        from: u64,
+        bytes: Vec<u8>,
+    },
     /// The channel's process finished. `status` is the raw wait status if known.
     Exited {
         channel: ChannelId,
@@ -210,9 +224,6 @@ pub fn negotiate(peer_version: u32) -> Negotiation {
 /// decode failure or an oversized frame means the two sides disagree about the
 /// bytes on the wire; retrying that forever would spin. Distinguishing them is
 /// what keeps reconnect from becoming an infinite loop.
-// Used by the reconnecting link, which lands next; kept here because it is the
-// classification the protocol defines, and it is covered by tests.
-#[allow(dead_code)]
 pub fn framing_error_is_retryable(error: &FramingError) -> bool {
     match error {
         FramingError::Io(_) | FramingError::UnexpectedEof => true,
@@ -296,6 +307,7 @@ mod tests {
             },
             FromHost::Data {
                 channel: 1,
+                from: 0,
                 bytes: vec![0x1b, b'[', b'2', b'J'],
             },
             FromHost::Exited {
@@ -321,29 +333,40 @@ mod tests {
         // Byte streams are what this protocol is for, so back-to-back frames
         // must decode independently rather than as one blob.
         let mut buffer = Vec::new();
+        let mut at = 0u64;
         for chunk in [&b"one"[..], &b"two"[..], &b"three"[..]] {
             write_frame(
                 &mut buffer,
                 &FromHost::Data {
                     channel: 3,
+                    from: at,
                     bytes: chunk.to_vec(),
                 },
             )
             .unwrap();
+            at += chunk.len() as u64;
         }
 
         let mut reader = buffer.as_slice();
         let mut seen = Vec::new();
         for _ in 0..3 {
-            let FromHost::Data { bytes, .. } = read_frame::<_, FromHost>(&mut reader).unwrap()
+            let FromHost::Data { from, bytes, .. } =
+                read_frame::<_, FromHost>(&mut reader).unwrap()
             else {
                 panic!("expected data frames");
             };
-            seen.push(bytes);
+            seen.push((from, bytes));
         }
+        // Positions as well as payloads: the offsets are what a reconnecting
+        // client reconciles against, so a frame that decodes with the wrong `from`
+        // is worse than one that fails to decode at all.
         assert_eq!(
             seen,
-            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+            vec![
+                (0, b"one".to_vec()),
+                (3, b"two".to_vec()),
+                (6, b"three".to_vec()),
+            ]
         );
     }
 
@@ -354,6 +377,7 @@ mod tests {
         let bytes: Vec<u8> = (0u8..=255).chain([0x1b, 0x00, 0xff]).collect();
         let message = FromHost::Data {
             channel: 9,
+            from: 12_345,
             bytes: bytes.clone(),
         };
 
@@ -438,6 +462,7 @@ mod tests {
             &mut buffer,
             &FromHost::Data {
                 channel: 1,
+                from: 0,
                 bytes: vec![1, 2, 3, 4, 5],
             },
         )

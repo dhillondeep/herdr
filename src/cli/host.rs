@@ -150,16 +150,17 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    let (link, mut child) = match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
-        Ok(connected) => connected,
+    let link = match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
+        Ok(link) => link,
         Err(err) => {
             eprintln!("{err}");
             return Ok(1);
         }
     };
     println!(
-        "connected to {host} (host protocol {})",
-        link.peer_version()
+        "connected to {host} (host protocol {}, link {:?})",
+        link.peer_version(),
+        link.status()
     );
 
     const MARKER: &str = "herdr-probe-ok";
@@ -173,7 +174,6 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
         Ok(opened) => opened,
         Err(err) => {
             eprintln!("could not start a process on {host}: {err}");
-            let _ = child.kill();
             return Ok(1);
         }
     };
@@ -202,8 +202,9 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // Explicit rather than left to the drop, so the probe does not sit in a
+    // redial backoff on its way out.
+    link.close();
 
     if seen.contains(MARKER) {
         println!("ran a command on {host} and read its output back");
