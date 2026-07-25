@@ -67,7 +67,7 @@ pub(crate) fn apply_agent_view(app: &AppState, entries: &mut Vec<AgentPanelEntry
     ) {
         entries.sort_by_key(|entry| {
             (
-                std::cmp::Reverse(super::api_helpers::tab_attention_priority(
+                std::cmp::Reverse(crate::attention::pane_attention_priority(
                     entry.state,
                     entry.seen,
                 )),
@@ -390,7 +390,7 @@ fn sort_value(
                     .unwrap_or_default(),
             )),
             AgentViewBuiltinSortField::Attention => Some(EvalValue::Number(u64::from(
-                super::api_helpers::tab_attention_priority(entry.state, entry.seen),
+                crate::attention::pane_attention_priority(entry.state, entry.seen),
             ))),
             AgentViewBuiltinSortField::Status => {
                 Some(EvalValue::String(status_name(entry.state, entry.seen)))
