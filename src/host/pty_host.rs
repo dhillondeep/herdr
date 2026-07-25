@@ -388,22 +388,58 @@ pub fn serve_socket(socket_path: &std::path::Path) -> std::io::Result<()> {
 
     let daemon = Daemon::new();
 
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else {
-            continue;
-        };
-        let reader = stream.try_clone()?;
-        let _ = serve_client(&daemon, reader, Box::new(stream));
+    // Non-blocking so idle time can be measured between connections.
+    listener.set_nonblocking(true)?;
+    let idle_exit = idle_exit_timeout();
+    let mut idle_since = Some(std::time::Instant::now());
 
-        // Exit once there is nothing left to keep alive, so an idle daemon does not
-        // linger, while a busy one survives any number of reconnects.
-        if daemon.live_channels() == 0 {
-            break;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // The listener is non-blocking, which the accepted socket can
+                // inherit; serving needs blocking reads.
+                stream.set_nonblocking(false)?;
+                idle_since = None;
+
+                let reader = stream.try_clone()?;
+                let _ = serve_client(&daemon, reader, Box::new(stream));
+
+                // The client left. Start the idle clock only if there is nothing
+                // to keep alive.
+                if daemon.live_channels() == 0 {
+                    idle_since = Some(std::time::Instant::now());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if daemon.live_channels() > 0 {
+                    // Busy: never expire while an agent is running, however long
+                    // the human is away.
+                    idle_since = None;
+                } else if idle_since.is_some_and(|since| since.elapsed() >= idle_exit) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
         }
     }
 
     let _ = std::fs::remove_file(socket_path);
     Ok(())
+}
+
+/// How long an empty daemon waits for a client before giving up.
+///
+/// A grace period rather than exiting the moment a client leaves: a daemon that
+/// died on the first disconnect would also die on any transient connection — a
+/// readiness probe, or a client that reconnects a moment later — and then the next
+/// attach would have to start it again. Never applies while a channel is live.
+fn idle_exit_timeout() -> std::time::Duration {
+    std::env::var("HERDR_PTY_HOST_IDLE_EXIT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(60))
 }
 
 /// Connect to the daemon, starting it if needed, and bridge stdio to it.
