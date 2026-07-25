@@ -223,6 +223,20 @@ fn run_with_timeout(command: &mut Command) -> std::io::Result<std::process::Outp
     }
 }
 
+/// Gather hosts off the UI thread and report them once.
+///
+/// Discovery shells out — a workspace-manager `list` can take seconds — so it
+/// must never run where a keypress is waiting. Run at startup so the picker has
+/// a warm list by the time anyone creates a workspace; if it has not finished,
+/// the picker simply offers fewer choices rather than stalling.
+pub fn discover_in_background(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    let candidates = gather(&builtin_discovery_commands(), &[]);
+    if candidates.is_empty() {
+        return;
+    }
+    let _ = events.blocking_send(crate::events::AppEvent::HostCandidatesDiscovered { candidates });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,4 @@
+use crate::app::state::{HostPickEntry, HostPickState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[cfg(test)]
 use ratatui::layout::Direction;
@@ -386,10 +387,107 @@ pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::Pa
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
+    state.pending_workspace_create_host = None;
     state.rename_pane_target = None;
     state.name_input = suggested_name;
     state.name_input_replace_on_type = true;
-    state.mode = Mode::RenameWorkspace;
+
+    // Ask where only when there is somewhere else to go. With no remote hosts a
+    // picker would be a one-row dialog every user has to dismiss.
+    if state.host_candidates.is_empty() {
+        state.host_pick = None;
+        state.mode = Mode::RenameWorkspace;
+        return;
+    }
+
+    state.host_pick = Some(HostPickState::new(
+        state
+            .host_candidates
+            .iter()
+            .map(|candidate| HostPickEntry {
+                host: Some(candidate.id.clone()),
+                origin: host_origin_label(candidate.origin).to_string(),
+            })
+            .collect(),
+    ));
+    state.mode = Mode::PickHost;
+}
+
+fn host_origin_label(origin: crate::host::discovery::HostOrigin) -> &'static str {
+    match origin {
+        crate::host::discovery::HostOrigin::SshConfig => "ssh-config",
+        crate::host::discovery::HostOrigin::Discovered => "discovered",
+        crate::host::discovery::HostOrigin::Configured => "configured",
+    }
+}
+
+/// Key handling for the host picker. Mirrors the worktree picker so both feel the
+/// same: arrows move, `/` focuses search, enter confirms, esc cancels creation.
+pub(crate) fn handle_host_pick_key(state: &mut AppState, key: crossterm::event::KeyCode) {
+    use crossterm::event::KeyCode;
+
+    match key {
+        KeyCode::Esc => {
+            // Esc abandons creating the workspace, not just the host choice —
+            // otherwise it would silently fall through to creating a local one.
+            state.host_pick = None;
+            state.pending_workspace_create_cwd = None;
+            state.pending_workspace_create_host = None;
+            state.mode = if state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
+        KeyCode::Up => {
+            if let Some(pick) = &mut state.host_pick {
+                pick.select_previous_filtered();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(pick) = &mut state.host_pick {
+                pick.select_next_filtered();
+            }
+        }
+        KeyCode::Enter => {
+            // No selection means the filter excluded everything; do nothing
+            // rather than fall back to local.
+            let chosen = state
+                .host_pick
+                .as_ref()
+                .and_then(|pick| pick.chosen())
+                .map(|entry| entry.host.clone());
+            if let Some(host) = chosen {
+                state.pending_workspace_create_host = host;
+                state.host_pick = None;
+                state.mode = Mode::RenameWorkspace;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(pick) = &mut state.host_pick {
+                pick.query.pop();
+                pick.normalize_selection();
+            }
+        }
+        KeyCode::Char('/') => {
+            if let Some(pick) = &mut state.host_pick {
+                if pick.search_focused {
+                    pick.query.push('/');
+                    pick.normalize_selection();
+                } else {
+                    pick.search_focused = true;
+                }
+            }
+        }
+        KeyCode::Char(ch) => {
+            if let Some(pick) = &mut state.host_pick {
+                pick.query.push(ch);
+                pick.search_focused = true;
+                pick.normalize_selection();
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(super) fn open_rename_active_tab(state: &mut AppState, replace_on_type: bool) {
@@ -1016,11 +1114,16 @@ impl App {
                 if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
                     let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
                     let label = workspace_create_label(&new_name, &suggested_name);
+                    let host = self
+                        .state
+                        .pending_workspace_create_host
+                        .take()
+                        .map(|host| host.to_string());
                     self.runtime_workspace_create(
                         "tui.workspace.create_named",
                         crate::api::schema::WorkspaceCreateParams {
                             cwd: Some(cwd.display().to_string()),
-                            host: None,
+                            host,
                             focus: true,
                             label,
                             env: Default::default(),

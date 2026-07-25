@@ -124,6 +124,11 @@ pub enum AppEvent {
         updated: Vec<crate::detect::manifest_update::ManifestUpdateCommit>,
         status: crate::detect::manifest_update::ManifestUpdateStatus,
     },
+    /// Background host discovery finished. Carries the neutral runtime type, not
+    /// a UI shape: the picker builds its rows from this when it opens.
+    HostCandidatesDiscovered {
+        candidates: Vec<crate::host::discovery::HostCandidate>,
+    },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },

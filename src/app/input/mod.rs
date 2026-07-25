@@ -37,7 +37,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 }
 
 mod copy_mode;
-mod modal;
+pub(crate) mod modal;
 mod mouse;
 mod navigate;
 mod overlays;
@@ -101,6 +101,9 @@ impl App {
                     self.handle_rename_key_via_api(key_event)
                 }
                 Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
+                Mode::PickHost => {
+                    super::input::modal::handle_host_pick_key(&mut self.state, key_event.code)
+                }
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),

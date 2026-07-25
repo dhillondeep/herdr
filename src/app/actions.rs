@@ -2808,6 +2808,10 @@ impl AppState {
             // AppState. Kept for AppEvent exhaustiveness.
             AppEvent::ClipboardWrite { .. } => Vec::new(),
             AppEvent::PrefixInputSource { .. } => Vec::new(),
+            AppEvent::HostCandidatesDiscovered { candidates } => {
+                self.host_candidates = candidates;
+                Vec::new()
+            }
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     return Vec::new();

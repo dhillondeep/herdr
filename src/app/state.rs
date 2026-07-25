@@ -756,12 +756,7 @@ impl WorktreeOpenState {
     }
 }
 
-// The picker's state and selection semantics land before the mode, key handler
-// and renderer that drive them. Deliberately split: this half is pure and fully
-// tested, while the UI half additionally needs discovery moved off the UI thread
-// (a discovery command can take seconds, and the list must render instantly).
 /// One row in the host picker: the local machine, or a discovered/configured host.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPickEntry {
     /// `None` is the local machine, which is always offered first.
@@ -770,7 +765,6 @@ pub struct HostPickEntry {
     pub origin: String,
 }
 
-#[allow(dead_code)]
 impl HostPickEntry {
     pub fn local() -> Self {
         Self {
@@ -805,7 +799,6 @@ impl HostPickEntry {
 ///
 /// Mirrors `WorktreeOpenState`: same filter/selection semantics, so the two
 /// pickers behave identically for the user.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPickState {
     pub entries: Vec<HostPickEntry>,
@@ -817,7 +810,6 @@ pub struct HostPickState {
     pub note: Option<String>,
 }
 
-#[allow(dead_code)]
 impl HostPickState {
     /// Local first, then hosts in the order discovery returned them.
     pub fn new(hosts: Vec<HostPickEntry>) -> Self {
@@ -934,6 +926,7 @@ pub enum Mode {
     RenameWorkspace,
     RenameTab,
     RenamePane,
+    PickHost,
     NewLinkedWorktree,
     OpenExistingWorktree,
     ConfirmRemoveWorktree,
@@ -1574,6 +1567,13 @@ pub struct AppState {
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
+    /// Host chosen for the workspace currently being created.
+    pub pending_workspace_create_host: Option<crate::host::HostId>,
+    /// Hosts found by background discovery. Read by the picker; never gathered
+    /// on the UI thread.
+    pub host_candidates: Vec<crate::host::discovery::HostCandidate>,
+    /// Open host picker, if any.
+    pub host_pick: Option<HostPickState>,
     pub rename_pane_target: Option<PaneId>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
@@ -1944,6 +1944,9 @@ impl AppState {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            pending_workspace_create_host: None,
+            host_candidates: Vec::new(),
+            host_pick: None,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -2807,6 +2810,144 @@ mod host_pick_tests {
             state.chosen().map(HostPickEntry::label),
             Some("coder.box1".into()),
             "selection must move to a row that is actually visible"
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_pick_flow_tests {
+    use super::*;
+    use crate::host::discovery::{HostCandidate, HostOrigin};
+
+    fn candidate(name: &str) -> HostCandidate {
+        HostCandidate {
+            id: crate::host::HostId::parse(name).unwrap(),
+            origin: HostOrigin::Discovered,
+        }
+    }
+
+    fn state_with_hosts(hosts: &[&str]) -> AppState {
+        let mut state = AppState::test_new();
+        state.host_candidates = hosts.iter().map(|name| candidate(name)).collect();
+        state
+    }
+
+    #[test]
+    fn creating_a_workspace_skips_the_picker_when_there_are_no_remote_hosts() {
+        // A one-row picker every user has to dismiss would be pure friction.
+        let mut state = state_with_hosts(&[]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+
+        assert_eq!(state.mode, Mode::RenameWorkspace);
+        assert!(state.host_pick.is_none());
+        assert_eq!(state.pending_workspace_create_host, None);
+    }
+
+    #[test]
+    fn creating_a_workspace_asks_where_when_hosts_exist() {
+        let mut state = state_with_hosts(&["coder.box1"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+
+        assert_eq!(state.mode, Mode::PickHost);
+        let pick = state.host_pick.as_ref().expect("picker should be open");
+        assert_eq!(pick.entries.len(), 2, "local plus the one host");
+        assert_eq!(pick.entries[0].host, None);
+    }
+
+    #[test]
+    fn choosing_a_host_carries_it_to_the_name_prompt() {
+        let mut state = state_with_hosts(&["coder.box1"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+
+        crate::app::input::modal::handle_host_pick_key(&mut state, crossterm::event::KeyCode::Down);
+        crate::app::input::modal::handle_host_pick_key(
+            &mut state,
+            crossterm::event::KeyCode::Enter,
+        );
+
+        assert_eq!(state.mode, Mode::RenameWorkspace);
+        assert!(state.host_pick.is_none());
+        assert_eq!(
+            state
+                .pending_workspace_create_host
+                .as_ref()
+                .map(|host| host.as_str()),
+            Some("coder.box1")
+        );
+    }
+
+    #[test]
+    fn choosing_local_leaves_no_host_binding() {
+        let mut state = state_with_hosts(&["coder.box1"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+        crate::app::input::modal::handle_host_pick_key(
+            &mut state,
+            crossterm::event::KeyCode::Enter,
+        );
+
+        assert_eq!(state.mode, Mode::RenameWorkspace);
+        assert_eq!(state.pending_workspace_create_host, None);
+    }
+
+    #[test]
+    fn escape_abandons_creation_rather_than_falling_through_to_local() {
+        // If esc only closed the picker, the pending cwd would still be set and
+        // the next name prompt would quietly create a local workspace.
+        let mut state = state_with_hosts(&["coder.box1"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+        crate::app::input::modal::handle_host_pick_key(&mut state, crossterm::event::KeyCode::Esc);
+
+        assert_ne!(state.mode, Mode::RenameWorkspace);
+        assert!(state.host_pick.is_none());
+        assert_eq!(state.pending_workspace_create_cwd, None);
+        assert_eq!(state.pending_workspace_create_host, None);
+    }
+
+    #[test]
+    fn enter_with_no_match_does_nothing_instead_of_choosing_local() {
+        let mut state = state_with_hosts(&["coder.box1"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+        for ch in "zzzz".chars() {
+            crate::app::input::modal::handle_host_pick_key(
+                &mut state,
+                crossterm::event::KeyCode::Char(ch),
+            );
+        }
+        crate::app::input::modal::handle_host_pick_key(
+            &mut state,
+            crossterm::event::KeyCode::Enter,
+        );
+
+        assert_eq!(state.mode, Mode::PickHost, "should still be picking");
+        assert!(state.host_pick.is_some());
+    }
+
+    #[test]
+    fn typing_filters_and_backspace_restores() {
+        let mut state = state_with_hosts(&["coder.box1", "other.box"]);
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+
+        for ch in "coder".chars() {
+            crate::app::input::modal::handle_host_pick_key(
+                &mut state,
+                crossterm::event::KeyCode::Char(ch),
+            );
+        }
+        assert_eq!(
+            state.host_pick.as_ref().unwrap().filtered_indices().len(),
+            1
+        );
+
+        for _ in 0..5 {
+            crate::app::input::modal::handle_host_pick_key(
+                &mut state,
+                crossterm::event::KeyCode::Backspace,
+            );
+        }
+        assert_eq!(
+            state.host_pick.as_ref().unwrap().filtered_indices().len(),
+            3,
+            "local plus both hosts"
         );
     }
 }

@@ -764,6 +764,103 @@ pub(crate) fn confirm_close_button_rects(inner: Rect) -> (Rect, Rect) {
     (rects[0], rects[1])
 }
 
+/// Host picker shown while creating a workspace.
+///
+/// Same shell, header, search row and selection affordances as the worktree
+/// picker, so the two read as one interaction rather than two inventions.
+pub(super) fn render_host_pick_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(pick) = app.host_pick.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let height = (pick.entries.len() as u16).saturating_add(7).clamp(10, 24);
+    let Some(inner) = render_modal_shell(frame, area, 72, height, &app.palette) else {
+        return;
+    };
+    if inner.height < 6 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "where should this workspace run?",
+        &app.palette,
+    );
+
+    let query_style = if pick.search_focused {
+        Style::default().fg(app.palette.text)
+    } else {
+        Style::default().fg(app.palette.overlay0)
+    };
+    let query_line = if pick.query.is_empty() {
+        "/ to search".to_string()
+    } else {
+        format!("/ {}", pick.query)
+    };
+    frame.render_widget(
+        Paragraph::new(query_line).style(query_style),
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize))
+            .style(Style::default().fg(app.palette.surface1)),
+        Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+    );
+
+    let filtered = pick.filtered_indices();
+    let rows_area_height = inner.height.saturating_sub(4) as usize;
+    let selected_idx = pick.selected_entry_index();
+
+    for (visible_idx, entry_idx) in filtered.iter().take(rows_area_height).enumerate() {
+        let Some(entry) = pick.entries.get(*entry_idx) else {
+            continue;
+        };
+        let selected = Some(*entry_idx) == selected_idx;
+        let y = inner.y.saturating_add(3 + visible_idx as u16);
+        if y >= inner.y.saturating_add(inner.height) {
+            break;
+        }
+        let row_style = if selected {
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.subtext0)
+        };
+        let marker = if selected { "›" } else { " " };
+        let detail = if entry.host.is_none() {
+            "this machine".to_string()
+        } else {
+            entry.origin.clone()
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{marker} {:<28}  {}", entry.label(), detail)).style(row_style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+
+    // Explain an empty result rather than showing a blank box.
+    let footer = if filtered.is_empty() {
+        "no host matches — esc to cancel".to_string()
+    } else if let Some(note) = pick.note.as_ref() {
+        note.clone()
+    } else {
+        "enter to choose · esc to cancel".to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(app.palette.overlay0)),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(inner.height.saturating_sub(1)),
+            inner.width,
+            1,
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{

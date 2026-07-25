@@ -224,6 +224,14 @@ fn auto_updates_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(debug_assertions)
 }
 
+/// Host discovery shells out to find machines, so it must not run in unit tests:
+/// the resulting event would perturb tests that assert on the internal event
+/// queue, and tests should not spawn subprocesses. Unlike auto-update it stays
+/// enabled in debug builds, so the feature is usable while developing.
+fn host_discovery_enabled(no_session: bool) -> bool {
+    !no_session && !cfg!(test)
+}
+
 fn background_update_check_enabled(no_session: bool, check_enabled: bool) -> bool {
     auto_updates_enabled(no_session) && check_enabled
 }
@@ -553,6 +561,9 @@ impl App {
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
+            pending_workspace_create_host: None,
+            host_candidates: Vec::new(),
+            host_pick: None,
             rename_pane_target: None,
             worktree_create: None,
             worktree_open: None,
@@ -716,6 +727,15 @@ impl App {
             let manifest_update_tx = event_tx.clone();
             std::thread::spawn(move || {
                 crate::detect::manifest_update::auto_update(manifest_update_tx)
+            });
+        }
+
+        // Warm the host list off-thread so the workspace picker never waits on a
+        // discovery command.
+        if host_discovery_enabled(no_session) {
+            let host_discovery_tx = event_tx.clone();
+            std::thread::spawn(move || {
+                crate::host::sources::discover_in_background(host_discovery_tx)
             });
         }
 
@@ -1756,6 +1776,9 @@ impl App {
             }
             Mode::NewLinkedWorktree => {
                 self.handle_worktree_create_key(key_event);
+            }
+            Mode::PickHost => {
+                crate::app::input::modal::handle_host_pick_key(&mut self.state, key.code);
             }
             Mode::OpenExistingWorktree => {
                 self.handle_worktree_open_key(key_event);
