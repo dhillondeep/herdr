@@ -304,6 +304,87 @@ fn jitter_fraction() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where ssh keeps the multiplexing socket for a host.
+///
+/// A shared master turns a redial into opening a channel on a connection that is
+/// already up, rather than a fresh TCP handshake, key exchange and — for hosts reached
+/// through a `ProxyCommand`, which is how workspace managers expose theirs — a fresh
+/// proxy process.
+///
+/// **This is not a measured speedup.** On a Coder-proxied workspace over a good link,
+/// a cold connection took 261ms and a multiplexed one 279ms: the same, within noise.
+/// What it actually buys is bounded work per redial on the paths where that work is
+/// not free — a host that re-authenticates, or a proxy that is slow to spawn — and one
+/// session per host instead of one per redial when a flapping network is reconnecting
+/// repeatedly. Anyone tempted to justify this by latency should measure their own path
+/// first; on this one there is nothing to find.
+///
+/// The path is derived from the target rather than from this process, so a herdr that
+/// restarts reuses a master that is still alive.
+///
+/// `None` when no short enough path is available, in which case multiplexing is simply
+/// not used: `sun_path` is byte-limited (104 on macOS, 108 on Linux) and a path over
+/// that limit makes ssh fail outright, which would be a worse trade than a slower
+/// reconnect.
+fn control_path(target: &str) -> Option<std::path::PathBuf> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut hasher = DefaultHasher::new();
+    target.hash(&mut hasher);
+    let name = format!("{:08x}", hasher.finish() as u32);
+
+    // Short bases first. `/tmp` is tried even when it is not the platform temp dir,
+    // because macOS temp paths are long enough on their own to exhaust the limit.
+    let mut bases = vec![std::path::PathBuf::from("/tmp")];
+    let platform = std::env::temp_dir();
+    if platform != std::path::Path::new("/tmp") {
+        bases.push(platform);
+    }
+
+    for base in bases {
+        // Per-user so two accounts on one machine cannot collide, and 0700 because a
+        // control socket is enough to open a session as its owner.
+        let dir = base.join(format!("herdr-ctl-{}", unsafe { libc::getuid() }));
+        let path = dir.join(&name);
+        if path.as_os_str().as_bytes().len() > 103 {
+            continue;
+        }
+        if std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .is_ok()
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Drop a multiplexing master that may be wedged.
+///
+/// A master whose network has gone but whose TCP has not yet noticed will accept a
+/// new channel and then hang. Every redial would inherit that until the master aged
+/// out, so retries clear it first: the cost is one short-lived ssh invocation at
+/// exactly the moment something has already gone wrong.
+fn drop_control_master(target: &str, path: &std::path::Path) {
+    let _ = std::process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-S")
+        .arg(path)
+        .arg("-O")
+        .arg("exit")
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 impl HostLink {
     /// Connect to a host by running `herdr pty-host` there over ssh.
     ///
@@ -318,9 +399,20 @@ impl HostLink {
         // Held across dials so a failure can quote what the host actually said.
         let last_stderr: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let stderr_slot = Arc::clone(&last_stderr);
+        let control = control_path(target);
+        let dialed_before = AtomicBool::new(false);
 
         let dialer: Dialer = Arc::new(move || {
-            let mut child = std::process::Command::new("ssh")
+            // Only on a retry: the first dial has nothing stale to clear, and doing
+            // it there would throw away a master another herdr is using.
+            if dialed_before.swap(true, Ordering::SeqCst) {
+                if let Some(path) = control.as_deref() {
+                    drop_control_master(&owned, path);
+                }
+            }
+
+            let mut command = std::process::Command::new("ssh");
+            command
                 .arg("-o")
                 .arg("BatchMode=yes")
                 // Fail fast on an unreachable host instead of sitting in ssh's
@@ -330,7 +422,20 @@ impl HostLink {
                 .arg("-o")
                 .arg("ServerAliveInterval=30")
                 .arg("-o")
-                .arg("ServerAliveCountMax=6")
+                .arg("ServerAliveCountMax=6");
+            if let Some(path) = control.as_deref() {
+                command
+                    .arg("-S")
+                    .arg(path)
+                    .arg("-o")
+                    .arg("ControlMaster=auto")
+                    // Bounded rather than `yes`: a master that outlives its usefulness
+                    // is a wedged connection waiting to be inherited, and the window
+                    // only has to cover a redial.
+                    .arg("-o")
+                    .arg("ControlPersist=30");
+            }
+            let mut child = command
                 // No tty: this is a framed byte protocol, and a pty would mangle it.
                 .arg("-T")
                 .arg(&owned)
@@ -1938,6 +2043,39 @@ mod tests {
         );
         let tail = String::from_utf8(drain(&mut actor, Duration::from_millis(300))).unwrap();
         assert_eq!(tail, "onwards", "cursor moved: {tail:?}");
+    }
+
+    #[test]
+    fn a_control_path_is_short_enough_for_a_unix_socket_and_stable_per_target() {
+        // Over the sun_path limit ssh fails outright rather than degrading, so a path
+        // that is too long would turn a working host into a broken one. And it has to
+        // be the same path every time for the same target, or a redial would build a
+        // second master instead of reusing the one that is already up — which is the
+        // entire point of having it.
+        use std::os::unix::ffi::OsStrExt;
+
+        let first = control_path("some-host.example.internal");
+        let again = control_path("some-host.example.internal");
+        assert_eq!(first, again, "must be stable for one target");
+        if let Some(path) = first.as_deref() {
+            assert!(path.as_os_str().as_bytes().len() <= 103, "{path:?}");
+        }
+
+        // Long names must not silently produce an unusable path.
+        let long = "a".repeat(400);
+        if let Some(path) = control_path(&long) {
+            assert!(path.as_os_str().as_bytes().len() <= 103, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn different_targets_do_not_share_a_control_socket() {
+        // Sharing one would multiplex two machines onto one connection, so a session
+        // could be opened on the wrong host entirely.
+        let a = control_path("host-a");
+        let b = control_path("host-b");
+        assert_ne!(a, b);
+        assert!(a.is_some() && b.is_some());
     }
 
     #[test]
