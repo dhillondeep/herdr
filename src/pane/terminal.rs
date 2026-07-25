@@ -409,6 +409,11 @@ impl PaneTerminal {
         self.ghostty.recent_unwrapped_ansi(lines)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn alternate_viewport_ansi(&self) -> Option<String> {
+        self.ghostty.alternate_viewport_ansi()
+    }
+
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.ghostty.recent_unwrapped_ansi_snapshot(lines)
     }
@@ -1763,6 +1768,19 @@ impl GhosttyPaneTerminal {
         self.recent_unwrapped_ansi_snapshot(lines).text
     }
 
+    /// The visible alternate screen as replayable ANSI, if there is anything on it.
+    ///
+    /// Gated to match its only caller, `PaneRuntime::handoff_history_ansi`, which is
+    /// unix-only along with the rest of the handoff path.
+    #[cfg(unix)]
+    pub(crate) fn alternate_viewport_ansi(&self) -> Option<String> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| ghostty_alternate_viewport_ansi(&core.terminal).ok())
+            .filter(|dump| !dump.is_empty())
+    }
+
     pub(crate) fn recent_unwrapped_ansi_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
         self.core
             .lock()
@@ -2426,6 +2444,54 @@ fn ghostty_recent_ansi_for_terminal(
         false,
         unwrap,
     )
+}
+
+/// Serialize the visible alternate screen as ANSI that reconstructs it.
+///
+/// The alternate screen has no scrollback, so there is no history to replay: what
+/// is on it *is* the entire state, and it is exactly what a full-screen agent is
+/// showing.
+///
+/// `read_ansi_viewport` rather than the history path for two reasons. It is bounded
+/// by `rows`, the visible grid, instead of `total_rows`, which is the wrong quantity
+/// for a screen defined by what is displayed. And it does not unwrap: a full-screen
+/// TUI's columns carry meaning, so joining a full row to the one below it — which
+/// the history serializer does deliberately, because it is right for reading back
+/// shell output — slides box drawing and padding out of alignment with each other
+/// and the result is unreadable rather than merely reflowed. That no-unwrap
+/// behaviour is a property of the viewport reader, so it is pinned by a test rather
+/// than assumed to stay put.
+///
+/// The dump enters the alternate screen and clears before writing, so it
+/// reconstructs in the right mode. Without that it would land in the primary
+/// screen's scrollback and vanish the instant the application switched screens.
+///
+/// The cursor is left at home rather than restored: its position is only available
+/// through the render state, and a full-screen application positions absolutely on
+/// its next draw anyway. Kitty graphics are *not* reproduced — the placements
+/// reference image data the receiving terminal has never been sent — so a pane
+/// using them comes back with its text intact and its images missing.
+#[cfg(unix)]
+fn ghostty_alternate_viewport_ansi(
+    terminal: &crate::ghostty::Terminal,
+) -> Result<String, crate::ghostty::Error> {
+    let rows = terminal.rows()?;
+    let cols = terminal.cols()?;
+    if rows == 0 || cols == 0 {
+        return Ok(String::new());
+    }
+    let body = terminal.read_ansi_viewport(
+        (0, 0),
+        (cols.saturating_sub(1), u32::from(rows.saturating_sub(1))),
+        // Rectangular, matching what this region actually is: whole rows of the
+        // visible grid. The two selection shapes coincide for a full-width span, so
+        // this states the intent rather than changing the output.
+        true,
+    )?;
+    if body.trim().is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("\x1b[?1049h\x1b[2J\x1b[H{body}\x1b[H"))
 }
 
 fn ghostty_recent_read_range(

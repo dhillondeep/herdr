@@ -1776,7 +1776,19 @@ impl PaneRuntime {
             .input_state()
             .is_some_and(|input_state| input_state.alternate_screen)
         {
-            return None;
+            // The primary screen's history is not what is on the display, so
+            // replaying it here would show the wrong thing — which is why this used
+            // to give up entirely. But giving up means a full-screen agent, the
+            // exact thing people reattach to, comes back blank. Serialize what is
+            // actually on the alternate screen instead.
+            //
+            // Dropped rather than truncated when it does not fit: a dump cut short
+            // ends mid-escape-sequence, and half a screen wrongly coloured is worse
+            // than an empty one that the application will redraw.
+            return self
+                .terminal
+                .alternate_viewport_ansi()
+                .filter(|dump| dump.len() <= crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE);
         }
         self.snapshot_history().map(|history| {
             truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
@@ -3738,7 +3750,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn handoff_history_ansi_skips_alternate_screen() {
+    async fn handoff_history_ansi_serializes_the_alternate_screen() {
+        // A full-screen agent is exactly what people reattach to, so this used to be
+        // the case that came back blank. What matters is that the alternate screen's
+        // own contents are what is replayed — not the primary screen's history,
+        // which is not on the display.
         let runtime = PaneRuntime::test_with_scrollback_bytes(
             40,
             5,
@@ -3746,6 +3762,51 @@ mod tests {
             b"primary\r\n\x1b[?1049halt-screen",
         );
 
+        let dump = runtime
+            .handoff_history_ansi()
+            .expect("the alternate screen should be replayable");
+        assert!(dump.contains("alt-screen"), "{dump:?}");
+        assert!(
+            !dump.contains("primary"),
+            "the primary screen's history is not what is on the display: {dump:?}"
+        );
+        // Must switch screens before writing, or it lands in the primary screen's
+        // scrollback and is lost the moment the application switches.
+        assert!(dump.starts_with("\x1b[?1049h"), "{dump:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_alternate_screen_dump_keeps_rows_separate_instead_of_unwrapping_them() {
+        // The property that makes this usable for a full-screen agent. The history
+        // serializer unwraps, joining a full row to its continuation, which is right
+        // for reading back shell output and wrong for a TUI: box drawing and padding
+        // are positioned relative to each other, so sliding one row into another
+        // does not reflow the frame, it destroys it.
+        let cols = 20usize;
+        let mut bytes = b"\x1b[?1049h".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', cols));
+        bytes.extend_from_slice(b"BBB");
+
+        let runtime = PaneRuntime::test_with_scrollback_bytes(cols as u16, 5, 4096, &bytes);
+        let dump = runtime.handoff_history_ansi().expect("replayable");
+
+        assert!(
+            !dump.contains(&format!("{}BBB", "A".repeat(cols))),
+            "the wrapped row was joined to its continuation: {dump:?}"
+        );
+        assert!(dump.contains(&"A".repeat(cols)), "{dump:?}");
+        assert!(dump.contains("BBB"), "{dump:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_alternate_screen_replays_nothing_rather_than_a_blank_frame() {
+        // Switching to the alternate screen and drawing nothing should not produce a
+        // payload: replaying a screenful of blanks would clear a pane that the
+        // application was about to redraw anyway.
+        let runtime =
+            PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary\r\n\x1b[?1049h");
         assert!(runtime.handoff_history_ansi().is_none());
     }
 
