@@ -411,6 +411,42 @@ pub fn should_skip_state_update(agent: Agent, screen_content: &str) -> bool {
     .skip_state_update
 }
 
+/// Build a detection straight from a state and a rule id, for tests.
+///
+/// Exists so the rule-id-to-blocker mapping can be checked without a manifest and a
+/// screenful of matching text: this is about how the classification travels, not about
+/// what matches, and going through real screen content would test the manifests
+/// instead.
+#[cfg(test)]
+pub(crate) fn detect_for_test(state: AgentState, matched_rule_id: Option<&str>) -> AgentDetection {
+    DetectionExplain {
+        agent: None,
+        state,
+        source: None,
+        matched_rule: matched_rule_id.map(|id| MatchedRule {
+            id: id.to_string(),
+            priority: 0,
+            region: "bottom".to_string(),
+            state,
+        }),
+        screen_detection_skipped: false,
+        visible_idle: false,
+        visible_blocker: false,
+        visible_working: false,
+        skip_state_update: false,
+        skipped_update_reason: None,
+        fallback_reason: None,
+        evaluated_rules: Vec::new(),
+        warning: None,
+        manifest_version: None,
+        cached_remote_version: None,
+        local_override_shadowing_remote: false,
+        remote_update_status: None,
+        remote_update_error: None,
+    }
+    .into_detection()
+}
+
 impl DetectionExplain {
     fn into_detection(self) -> AgentDetection {
         AgentDetection {
@@ -419,6 +455,17 @@ impl DetectionExplain {
             visible_idle: self.visible_idle,
             visible_blocker: self.visible_blocker,
             visible_working: self.visible_working,
+            // Only classify an actual blocker. A rule id that happens to contain
+            // "permission" on an idle screen would otherwise label a pane as needing
+            // a decision it is not waiting for.
+            blocker: if self.state == AgentState::Blocked {
+                self.matched_rule
+                    .as_ref()
+                    .map(|matched| crate::detect::blocker_kind_from_rule_id(&matched.id))
+                    .unwrap_or(crate::detect::BlockerKind::Unknown)
+            } else {
+                crate::detect::BlockerKind::Unknown
+            },
         }
     }
 }

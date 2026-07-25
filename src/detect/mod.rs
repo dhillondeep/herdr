@@ -36,6 +36,15 @@ pub struct AgentDetection {
     /// activity is the normal working authority; this remains diagnostic
     /// metadata and for non-PTY fallback paths.
     pub visible_working: bool,
+    /// What kind of attention a blocked agent needs, read from the rule that
+    /// matched.
+    ///
+    /// Only meaningful while `state` is `Blocked`; `Unknown` otherwise, and
+    /// `Unknown` also when the matched rule does not say. It is carried on the
+    /// detection rather than recomputed later because the rule that produced the
+    /// state is only in scope here — deriving it downstream would mean guessing from
+    /// the state alone, which is exactly the guess this is meant to avoid.
+    pub blocker: BlockerKind,
 }
 
 /// What kind of attention a blocked agent needs.
@@ -325,6 +334,7 @@ pub fn detect_agent_with_osc(
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            blocker: BlockerKind::Unknown,
         };
     };
     manifest::detect_with_osc(
@@ -1372,6 +1382,39 @@ mod tests {
 #[cfg(test)]
 mod blocker_kind_tests {
     use super::*;
+
+    #[test]
+    fn a_blocked_detection_carries_the_kind_from_the_rule_that_matched() {
+        // The whole point of putting this on the detection: the rule that produced
+        // the state is only in scope where detection happens, so anything downstream
+        // would have to guess from the state alone.
+        let detection = crate::detect::manifest::detect_for_test(
+            AgentState::Blocked,
+            Some("permission_hints_blocked"),
+        );
+        assert_eq!(detection.blocker, BlockerKind::Permission);
+    }
+
+    #[test]
+    fn a_rule_id_is_only_classified_when_the_agent_is_actually_blocked() {
+        // A rule id containing "permission" that matched on an idle screen must not
+        // label the pane as waiting for a decision it is not waiting for.
+        for state in [AgentState::Idle, AgentState::Working, AgentState::Unknown] {
+            let detection =
+                crate::detect::manifest::detect_for_test(state, Some("permission_hints_blocked"));
+            assert_eq!(
+                detection.blocker,
+                BlockerKind::Unknown,
+                "{state:?} must not carry a blocker kind"
+            );
+        }
+    }
+
+    #[test]
+    fn a_blocked_detection_with_no_matched_rule_admits_it_does_not_know() {
+        let detection = crate::detect::manifest::detect_for_test(AgentState::Blocked, None);
+        assert_eq!(detection.blocker, BlockerKind::Unknown);
+    }
 
     // Every id below is taken verbatim from src/detect/manifests/*.toml, so this
     // tests the classification against what the manifests actually contain rather

@@ -309,6 +309,8 @@ pub(super) fn detection_update_for_publish_with_osc(
             visible_idle: true,
             visible_blocker: false,
             visible_working: false,
+            // A finished process is not blocked on anything.
+            blocker: crate::detect::BlockerKind::Unknown,
         });
     }
 
@@ -346,6 +348,7 @@ mod tests {
             visible_idle: state == AgentState::Idle,
             visible_blocker: false,
             visible_working: state == AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
         }
     }
 
