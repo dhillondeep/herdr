@@ -150,6 +150,12 @@ mod client {
             bytes: Vec<u8>,
         },
         #[allow(dead_code)]
+        Snapshot {
+            channel: u64,
+            out_offset: u64,
+            ansi: String,
+        },
+        #[allow(dead_code)]
         Desync {
             channel: u64,
             available_from: u64,
@@ -201,7 +207,7 @@ impl Bridge {
     fn spawn(argv: &[&str], rows: u16, cols: u16) -> Self {
         let (daemon, mut stdout, mut stdin) = Daemon::start();
 
-        client::write(&mut stdin, &ToHost::Hello { version: 3 }).expect("hello");
+        client::write(&mut stdin, &ToHost::Hello { version: 4 }).expect("hello");
         let welcome: FromHost = client::read(&mut stdout).expect("welcome");
         assert!(matches!(welcome, FromHost::Welcome { .. }));
 

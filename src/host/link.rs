@@ -881,6 +881,21 @@ fn dispatch_from_host(
                 deliver(&shared, channel, from, &bytes);
                 note_resume(&shared, channel, PaneResume::Resumed);
             }
+            FromHost::Snapshot {
+                channel,
+                out_offset,
+                ansi,
+            } => {
+                // Too far behind to replay, but the host re-derived the screen. Show
+                // it rather than a blank pane: this is the case an overnight reattach
+                // always lands in, so it is the one that decides whether any of this
+                // is worth having.
+                if reseed(&shared, channel, out_offset, &ansi) {
+                    note_resume(&shared, channel, PaneResume::Truncated);
+                } else {
+                    note_resume(&shared, channel, PaneResume::Resumed);
+                }
+            }
             FromHost::Desync {
                 channel,
                 available_from: _,
@@ -1053,6 +1068,50 @@ fn resync(shared: &Arc<Shared>, channel: ChannelId, host_offset: u64) -> bool {
         map.remove(&channel);
     }
     true
+}
+
+/// Replace a pane's screen with a host-rendered snapshot.
+///
+/// Returns whether anything was actually restored, so a stale snapshot — one the
+/// parser has already advanced past — is ignored the same way a stale `Desync` is,
+/// rather than winding the cursor backwards.
+///
+/// The scrollback behind the snapshot is genuinely gone, so it is marked. Showing
+/// the screen without saying the history is missing would leave the user scrolling
+/// up into output that silently predates the gap.
+fn reseed(shared: &Arc<Shared>, channel: ChannelId, host_offset: u64, ansi: &str) -> bool {
+    let Ok(mut map) = shared.channels.lock() else {
+        return false;
+    };
+    let Some(end) = map.get_mut(&channel) else {
+        return false;
+    };
+    if host_offset <= end.out_offset {
+        return false;
+    }
+
+    let missing = host_offset - end.out_offset;
+    end.truncated = true;
+    end.out_offset = host_offset;
+
+    // Reset first: the snapshot assumes a known parser state, and whatever the gap
+    // left half-parsed would otherwise swallow the front of it.
+    let mut payload = Vec::from(RESYNC);
+    payload.extend_from_slice(ansi.as_bytes());
+    payload.extend_from_slice(&snapshot_marker(missing));
+    if end.local.write_all(&payload).is_err() {
+        map.remove(&channel);
+    }
+    true
+}
+
+/// Text the user sees when the screen was restored but the history behind it was not.
+fn snapshot_marker(missing: u64) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[2m-- herdr: reconnected; screen restored, {missing} bytes of scrollback \
+         were lost --\x1b[0m\r\n"
+    )
+    .into_bytes()
 }
 
 /// Text the user sees where output was lost.
@@ -1740,6 +1799,100 @@ mod tests {
             },
             "a frame ahead of the cursor leaves a hole that must be reported"
         );
+    }
+
+    #[test]
+    fn a_snapshot_restores_the_screen_and_says_the_scrollback_went() {
+        // The overnight case. Replay is bounded by the host's log, so any long
+        // absence lands here — and a pane that comes back blank is the difference
+        // between this feature being useful and merely being safe.
+        let (link, hosts, mut host) = connect_link(9);
+        let (channel, mut actor) = open_pane(&link, &mut host);
+        host_send(
+            &mut host,
+            &FromHost::Data {
+                channel,
+                from: 0,
+                bytes: b"early".to_vec(),
+            },
+        );
+        assert_eq!(read_until(&mut actor, "early"), "early");
+        drop(host);
+
+        let mut second = next_connection(&hosts);
+        greet(&mut second, 9);
+        let _ = host_recv(&mut second); // Attach
+        host_send(
+            &mut second,
+            &FromHost::Snapshot {
+                channel,
+                out_offset: 500_005,
+                ansi: "\x1b[2J\x1b[Hrestored-screen".to_string(),
+            },
+        );
+
+        let seen = drain(&mut actor, Duration::from_millis(400));
+        assert!(
+            seen.starts_with(RESYNC),
+            "the parser must be reset before the snapshot, or whatever the gap left \
+             half-parsed swallows the front of it: {seen:?}"
+        );
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.contains("restored-screen"), "{text}");
+        // The screen is back but the history behind it is not, and saying so is the
+        // difference between honest and merely reassuring.
+        assert!(text.contains("scrollback"), "{text}");
+        assert!(text.contains("500000"), "must name the loss: {text}");
+        assert!(link.channel_truncated(channel));
+        assert_eq!(
+            link.drain_resume_events(),
+            vec![(channel, PaneResume::Truncated)]
+        );
+
+        // And the cursor moved to the snapshot's position, so live output lines up.
+        host_send(
+            &mut second,
+            &FromHost::Data {
+                channel,
+                from: 500_005,
+                bytes: b"live".to_vec(),
+            },
+        );
+        let tail = String::from_utf8(drain(&mut actor, Duration::from_millis(400))).unwrap();
+        assert_eq!(tail, "live", "no second marker: {tail:?}");
+    }
+
+    #[test]
+    fn a_snapshot_behind_the_cursor_is_ignored_rather_than_obeyed() {
+        // Same race as a stale desync: live output can carry the parser past the point
+        // the snapshot describes while it is in flight. Painting it then would replace
+        // the current screen with an older one — visibly wrong, and it would look like
+        // the agent had undone its own work.
+        let (link, _hosts, mut host) = connect_link(1);
+        let (channel, mut actor) = open_pane(&link, &mut host);
+        host_send(
+            &mut host,
+            &FromHost::Data {
+                channel,
+                from: 0,
+                bytes: b"0123456789".to_vec(),
+            },
+        );
+        assert_eq!(read_until(&mut actor, "0123456789"), "0123456789");
+
+        host_send(
+            &mut host,
+            &FromHost::Snapshot {
+                channel,
+                out_offset: 4,
+                ansi: "\x1b[2J\x1b[Hstale".to_string(),
+            },
+        );
+        assert!(
+            drain(&mut actor, Duration::from_millis(300)).is_empty(),
+            "a stale snapshot must not repaint the pane"
+        );
+        assert!(!link.channel_truncated(channel), "nothing was lost");
     }
 
     #[test]

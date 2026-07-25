@@ -20,7 +20,7 @@ pub use crate::protocol::wire::FramingError;
 /// per machine and may lag, so compatibility is a *range* rather than equality —
 /// see [`negotiate`]. Exact-match versioning here would mean one stale host
 /// bricks that host until re-provisioned.
-pub const HOST_PROTOCOL_VERSION: u32 = 3;
+pub const HOST_PROTOCOL_VERSION: u32 = 4;
 
 /// Oldest host protocol this build can still talk to.
 ///
@@ -31,7 +31,7 @@ pub const HOST_PROTOCOL_VERSION: u32 = 3;
 /// binary reports a clear version mismatch telling the user to re-provision, which
 /// `herdr host install` makes a one-liner. Once the message set settles this stops
 /// moving and the range starts doing real work.
-pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 3;
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 4;
 
 /// Cap on a single host frame. Output is chunked well below this; the cap exists
 /// so a corrupted length prefix cannot make us allocate wildly.
@@ -162,9 +162,28 @@ pub enum FromHost {
         from: u64,
         bytes: Vec<u8>,
     },
-    /// The pane is alive but the client is too far behind to be caught up without a
-    /// gap. It must resync from a fresh view and mark its scrollback truncated,
-    /// never continue as if nothing happened: a hole fed to a VT parser is
+    /// The pane is alive and too far behind to replay, but here is what its screen
+    /// looks like right now.
+    ///
+    /// This is what makes a long absence useful rather than merely safe. Replay is
+    /// bounded by the log, so any reattach after more than a few minutes of a busy
+    /// agent falls off the end of it — and a `Desync` alone leaves the pane blank
+    /// until the application happens to redraw, which for an idle full-screen agent
+    /// may be never. The screen is re-derived on the host, where the bytes are.
+    ///
+    /// Scrollback is *not* included and the client must mark it truncated: this is
+    /// the current screen, not the history behind it.
+    Snapshot {
+        channel: ChannelId,
+        /// Stream position the snapshot reflects. The client continues from here.
+        out_offset: u64,
+        /// ANSI that reconstructs the screen, including the mode switch when the
+        /// content lives on the alternate screen.
+        ansi: String,
+    },
+    /// The pane is alive, the client is too far behind to be caught up without a
+    /// gap, and no snapshot could be produced. It must mark its scrollback truncated
+    /// and never continue as if nothing happened: a hole fed to a VT parser is
     /// permanent corruption, not a missing frame.
     Desync {
         channel: ChannelId,

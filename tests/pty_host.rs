@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 mod protocol {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 3;
+    pub const HOST_PROTOCOL_VERSION: u32 = 4;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {

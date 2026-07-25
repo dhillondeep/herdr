@@ -40,7 +40,8 @@ const OUTPUT_LOG_CAPACITY: usize = 1024 * 1024;
 /// the oldest bytes are dropped and a client that far behind gets a `Desync` rather
 /// than a silent hole — a gap fed to a downstream VT parser is permanent grid
 /// corruption, not a dropped frame.
-#[derive(Debug)]
+// No `Debug`: the shadow terminal is an opaque VT handle, and a whole grid is not
+// something anyone wants in a log line anyway.
 struct OutputLog {
     /// Offset of the oldest byte still held.
     start: u64,
@@ -61,6 +62,29 @@ struct OutputLog {
     /// that lock is also what orders appends against sends: the check and the append
     /// happen together, so no byte can fall between the two.
     ready: bool,
+    /// Shadow of this channel's visible screen, for the snapshot a client gets when
+    /// it has fallen too far behind to be caught up by replay.
+    ///
+    /// A second VT parser is a cost worth naming: every byte is parsed twice, once
+    /// here and once by the client that owns the real grid. It buys the only thing
+    /// that makes a long absence useful rather than merely safe — replay is bounded
+    /// by the log, so any reattach after more than a few minutes of a busy agent
+    /// falls off the end of it, and without a screen to send the pane comes back
+    /// blank until the application happens to redraw. For an idle full-screen agent
+    /// that may be never.
+    ///
+    /// The usual hazard with two emulators is that they disagree. Here they are the
+    /// same code in the same binary at the same vendored VT version, and a host whose
+    /// version does not match is refused at the handshake rather than trusted.
+    ///
+    /// It lives in the log rather than beside it because one lock has to order both.
+    /// A snapshot is only usable if the offset sent with it is exactly what the
+    /// screen has consumed; two locks would let those drift, and the difference would
+    /// be output silently missing from a restored pane.
+    ///
+    /// `None` when a shadow could not be created. Losing the snapshot degrades a
+    /// reattach to `Desync`; failing the spawn would lose the pane.
+    screen: Option<crate::ghostty::Terminal>,
 }
 
 impl OutputLog {
@@ -73,10 +97,39 @@ impl OutputLog {
             // A freshly spawned channel needs no attach: the client has known about
             // it from its first byte.
             ready: true,
+            screen: None,
         }
     }
 
+    /// A log that also keeps a shadow of the visible screen.
+    ///
+    /// Scrollback is deliberately zero: the client owns the history, and this exists
+    /// only to answer "what is on the screen right now" for a client too far behind
+    /// to replay. Keeping scrollback here would duplicate the client's, on a machine
+    /// herdr does not own, for no gain.
+    fn with_screen(capacity: usize, cols: u16, rows: u16) -> Self {
+        let mut log = Self::new(capacity);
+        log.screen = crate::ghostty::Terminal::new(cols, rows, 0)
+            .inspect_err(|err| tracing::warn!(err = ?err, "no screen shadow; reattach will desync"))
+            .ok();
+        log
+    }
+
+    /// Serialize the shadow screen, if there is one with anything on it.
+    fn screen_ansi(&self) -> Option<String> {
+        self.screen
+            .as_ref()?
+            .visible_screen_ansi()
+            .ok()
+            .filter(|ansi| !ansi.is_empty())
+    }
+
     fn append(&mut self, bytes: &[u8]) {
+        // Fed here rather than at the call site so it cannot be forgotten and cannot
+        // drift: the screen has consumed exactly the bytes the offsets account for.
+        if let Some(screen) = self.screen.as_mut() {
+            screen.write(bytes);
+        }
         self.buffer.extend(bytes.iter().copied());
         self.end += bytes.len() as u64;
         // Trim from the front, advancing `start` by exactly what was dropped so the
@@ -311,17 +364,28 @@ fn handle(
             cell_width_px,
             cell_height_px,
         } => {
-            if let Ok(map) = channels.lock() {
-                if let Some(entry) = map.get(&channel) {
-                    // The ioctl belongs here, on the machine that owns the PTY.
-                    let _ = crate::pty::fd::resize_pty_fd(
-                        entry.master_fd,
-                        rows,
-                        cols,
-                        cell_width_px,
-                        cell_height_px,
-                    );
-                }
+            let log = if let Ok(map) = channels.lock() {
+                let Some(entry) = map.get(&channel) else {
+                    return;
+                };
+                // The ioctl belongs here, on the machine that owns the PTY.
+                let _ = crate::pty::fd::resize_pty_fd(
+                    entry.master_fd,
+                    rows,
+                    cols,
+                    cell_width_px,
+                    cell_height_px,
+                );
+                Arc::clone(&entry.log)
+            } else {
+                return;
+            };
+            // The shadow screen has to follow, or a snapshot would reconstruct the
+            // pane at the size it had before the last resize — subtly wrong in a way
+            // that looks like the agent drawing badly rather than like a herdr bug.
+            let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+            if let Some(screen) = log.screen.as_mut() {
+                let _ = screen.resize(cols, rows, cell_width_px, cell_height_px);
             }
         }
         ToHost::Shutdown { channel } => shutdown_channel(channels, channel),
@@ -397,10 +461,21 @@ fn answer_attach(
             from: offset,
             bytes,
         },
-        None => FromHost::Desync {
-            channel,
-            available_from: log.start,
-            out_offset: log.end,
+        // Too far behind to replay. A screen is far better than nothing here: it is
+        // what the pane actually looks like, whereas a bare desync leaves it blank
+        // until the application redraws — which an idle full-screen agent may never
+        // do. Falls back to the desync when there is no shadow to serialize.
+        None => match log.screen_ansi() {
+            Some(ansi) => FromHost::Snapshot {
+                channel,
+                out_offset: log.end,
+                ansi,
+            },
+            None => FromHost::Desync {
+                channel,
+                available_from: log.start,
+                out_offset: log.end,
+            },
         },
     };
     send(out, &answer);
@@ -437,7 +512,11 @@ fn spawn_channel(
     };
     let writer_file = std::fs::File::from(spawned.master_fd);
 
-    let log = Arc::new(Mutex::new(OutputLog::new(OUTPUT_LOG_CAPACITY)));
+    let log = Arc::new(Mutex::new(OutputLog::with_screen(
+        OUTPUT_LOG_CAPACITY,
+        spec.cols,
+        spec.rows,
+    )));
 
     channels.lock().map_err(|_| poisoned())?.insert(
         channel,

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod client {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 3;
+    pub const HOST_PROTOCOL_VERSION: u32 = 4;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -89,6 +89,11 @@ mod client {
             channel: u64,
             from: u64,
             bytes: Vec<u8>,
+        },
+        Snapshot {
+            channel: u64,
+            out_offset: u64,
+            ansi: String,
         },
         Desync {
             channel: u64,
@@ -394,6 +399,7 @@ fn next_for_channel(stream: &mut UnixStream, channel: u64) -> FromHost {
             Ok(message) => {
                 let concerns = match &message {
                     FromHost::Replay { channel: c, .. }
+                    | FromHost::Snapshot { channel: c, .. }
                     | FromHost::Desync { channel: c, .. }
                     | FromHost::Gone { channel: c, .. } => *c == channel,
                     _ => false,
@@ -623,16 +629,22 @@ fn reattaching_to_a_finished_pane_reports_gone_child_exited() {
 }
 
 #[test]
-fn reattaching_with_an_impossible_offset_desyncs_rather_than_guessing() {
-    // An offset the daemon never produced cannot be resumed from. Sending nothing
-    // would look like a healthy idle pane.
-    let socket = scratch("resume-desync");
-    let heartbeat = scratch("resume-desync-beat");
+fn an_unresumable_offset_gets_the_screen_the_host_re_derived() {
+    // An offset the daemon never produced cannot be replayed from, and sending
+    // nothing would look like a healthy idle pane. But a bare "you are out of sync"
+    // leaves the pane blank until the application redraws, which for an idle
+    // full-screen agent may be never — so the host parses its own output and sends
+    // back what the screen actually looks like. This is the path every overnight
+    // reattach takes, so it is the one that decides whether any of this is useful.
+    let socket = scratch("resume-snapshot");
+    let heartbeat = scratch("resume-snapshot-beat");
     let _ = std::fs::remove_file(&heartbeat);
 
     let daemon = Daemon::start(socket.clone());
     let (mut stream, epoch) = daemon.connect_with_epoch();
     spawn_heartbeat(&mut stream, 1, &heartbeat);
+    // Let the pane draw something for the shadow screen to hold.
+    std::thread::sleep(Duration::from_millis(400));
 
     client::write(
         &mut stream,
@@ -644,11 +656,58 @@ fn reattaching_with_an_impossible_offset_desyncs_rather_than_guessing() {
     .expect("attach");
 
     match next_for_channel(&mut stream, 1) {
-        FromHost::Desync { out_offset, .. } => {
+        FromHost::Snapshot {
+            out_offset, ansi, ..
+        } => {
             assert!(out_offset < u64::MAX / 2);
+            // The host's own parse of the pane's output, not a canned frame.
+            assert!(ansi.contains("tick"), "{ansi:?}");
         }
-        other => panic!("expected Desync, got {other:?}"),
+        other => panic!("expected Snapshot, got {other:?}"),
     }
 
     let _ = std::fs::remove_file(&heartbeat);
+}
+
+#[test]
+fn an_unresumable_offset_still_desyncs_when_there_is_no_screen_to_send() {
+    // The snapshot is an improvement on the desync, not a replacement for it. A pane
+    // that has drawn nothing has no screen worth sending, and inventing a blank one
+    // would clear a pane for no reason.
+    let socket = scratch("resume-desync");
+
+    let daemon = Daemon::start(socket.clone());
+    let (mut stream, epoch) = daemon.connect_with_epoch();
+    client::write(
+        &mut stream,
+        &ToHost::Spawn {
+            channel: 1,
+            spec: SpawnSpec {
+                argv: vec!["sleep".to_string(), "30".to_string()],
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+        },
+    )
+    .expect("spawn");
+    match client::read::<_, FromHost>(&mut stream).expect("spawned") {
+        FromHost::Spawned { pid, .. } => assert!(pid > 0),
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    client::write(
+        &mut stream,
+        &ToHost::Attach {
+            host_epoch: epoch,
+            panes: vec![(1, u64::MAX / 2)],
+        },
+    )
+    .expect("attach");
+
+    match next_for_channel(&mut stream, 1) {
+        FromHost::Desync { out_offset, .. } => assert!(out_offset < u64::MAX / 2),
+        other => panic!("expected Desync for a pane with a blank screen, got {other:?}"),
+    }
 }
