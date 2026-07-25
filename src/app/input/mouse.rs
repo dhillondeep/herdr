@@ -191,6 +191,30 @@ impl AppState {
             return None;
         }
 
+        if self.mode == Mode::PickHost {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(pick) = &mut self.host_pick {
+                        pick.select_previous_filtered();
+                    }
+                    return None;
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(pick) = &mut self.host_pick {
+                        pick.select_next_filtered();
+                    }
+                    return None;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.click_host_pick_row(mouse.column, mouse.row);
+                    return None;
+                }
+                // Any other mouse event inside the picker is swallowed: it must
+                // not fall through and act on the terminal behind the overlay.
+                _ => return None,
+            }
+        }
+
         if self.mode == Mode::OpenExistingWorktree {
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
@@ -1489,6 +1513,41 @@ impl AppState {
         self.active
             .and_then(|i| self.runtime_for_pane_in_workspace(terminal_runtimes, i, pane_id))
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+    }
+
+    /// Select the clicked host row, and confirm it on the row that is already
+    /// selected so a second click acts as "choose this one".
+    ///
+    /// Geometry comes from the same helpers the renderer uses, so a click cannot
+    /// land on a different row than the one drawn there.
+    fn click_host_pick_row(&mut self, column: u16, row: u16) {
+        let screen = self.screen_rect();
+        let Some(pick) = self.host_pick.as_ref() else {
+            return;
+        };
+        let Some(inner) = crate::ui::host_pick_inner_rect(screen, pick.entries.len()) else {
+            return;
+        };
+        if column < inner.x || column >= inner.x.saturating_add(inner.width) {
+            return;
+        }
+
+        let filtered = pick.filtered_indices();
+        let visible = crate::ui::host_pick_max_visible_rows(inner).min(filtered.len());
+        let Some(offset) = crate::ui::host_pick_row_at(inner, row, visible) else {
+            return;
+        };
+        let Some(entry_idx) = filtered.get(offset).copied() else {
+            return;
+        };
+
+        let already_selected = pick.selected_entry_index() == Some(entry_idx);
+        if let Some(pick) = &mut self.host_pick {
+            pick.selected = entry_idx;
+        }
+        if already_selected {
+            crate::app::input::modal::handle_host_pick_key(self, crossterm::event::KeyCode::Enter);
+        }
     }
 
     fn handle_right_click_passthrough(

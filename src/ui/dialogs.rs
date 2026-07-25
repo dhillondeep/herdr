@@ -178,6 +178,39 @@ pub(crate) fn remove_worktree_button_rects(inner: Rect, force_confirmation: bool
     (rects[0], rects[1])
 }
 
+/// Height of the host picker, derived from its row count.
+///
+/// Shared by the renderer and mouse hit-testing: if the two computed geometry
+/// separately they would drift and clicks would land on the wrong row.
+pub(crate) fn host_pick_height(entry_count: usize) -> u16 {
+    (entry_count as u16).saturating_add(7).clamp(10, 24)
+}
+
+pub(crate) fn host_pick_inner_rect(area: Rect, entry_count: usize) -> Option<Rect> {
+    centered_popup_rect(area, 72, host_pick_height(entry_count)).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// Index into the filtered list that a click at `row` targets, if any.
+pub(crate) fn host_pick_row_at(inner: Rect, row: u16, visible_rows: usize) -> Option<usize> {
+    let first = inner.y.saturating_add(3);
+    if row < first {
+        return None;
+    }
+    let offset = (row - first) as usize;
+    (offset < visible_rows).then_some(offset)
+}
+
+pub(crate) fn host_pick_max_visible_rows(inner: Rect) -> usize {
+    inner.height.saturating_sub(4) as usize
+}
+
 pub(crate) fn open_existing_worktree_inner_rect(area: Rect, entry_count: usize) -> Option<Rect> {
     let height = (entry_count as u16)
         .saturating_mul(2)
@@ -774,8 +807,13 @@ pub(super) fn render_host_pick_overlay(app: &AppState, frame: &mut Frame, area: 
     };
 
     super::dim_background(frame, area);
-    let height = (pick.entries.len() as u16).saturating_add(7).clamp(10, 24);
-    let Some(inner) = render_modal_shell(frame, area, 72, height, &app.palette) else {
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        72,
+        host_pick_height(pick.entries.len()),
+        &app.palette,
+    ) else {
         return;
     };
     if inner.height < 6 {
@@ -810,7 +848,7 @@ pub(super) fn render_host_pick_overlay(app: &AppState, frame: &mut Frame, area: 
     );
 
     let filtered = pick.filtered_indices();
-    let rows_area_height = inner.height.saturating_sub(4) as usize;
+    let rows_area_height = host_pick_max_visible_rows(inner);
     let selected_idx = pick.selected_entry_index();
 
     for (visible_idx, entry_idx) in filtered.iter().take(rows_area_height).enumerate() {

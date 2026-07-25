@@ -2951,3 +2951,74 @@ mod host_pick_flow_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod host_pick_mouse_tests {
+    use super::*;
+    use crate::host::discovery::{HostCandidate, HostOrigin};
+
+    fn state_with_picker(hosts: &[&str]) -> AppState {
+        let mut state = AppState::test_new();
+        state.host_candidates = hosts
+            .iter()
+            .map(|name| HostCandidate {
+                id: crate::host::HostId::parse(name).unwrap(),
+                origin: HostOrigin::Discovered,
+            })
+            .collect();
+        crate::app::input::modal::open_new_workspace_dialog(&mut state, "/tmp/proj".into());
+        state
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_that_was_drawn_there() {
+        // The renderer and the hit-test share geometry helpers; this pins them
+        // together so a layout change cannot silently offset clicks.
+        let state = state_with_picker(&["coder.box1", "other.box"]);
+        let pick = state.host_pick.as_ref().unwrap();
+        let screen = Rect::new(0, 0, 120, 40);
+        let inner = crate::ui::host_pick_inner_rect(screen, pick.entries.len()).unwrap();
+
+        let first_row = inner.y.saturating_add(3);
+        assert_eq!(crate::ui::host_pick_row_at(inner, first_row, 3), Some(0));
+        assert_eq!(
+            crate::ui::host_pick_row_at(inner, first_row + 1, 3),
+            Some(1)
+        );
+        assert_eq!(
+            crate::ui::host_pick_row_at(inner, first_row + 2, 3),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn clicks_above_the_first_row_and_past_the_last_hit_nothing() {
+        let state = state_with_picker(&["coder.box1"]);
+        let pick = state.host_pick.as_ref().unwrap();
+        let screen = Rect::new(0, 0, 120, 40);
+        let inner = crate::ui::host_pick_inner_rect(screen, pick.entries.len()).unwrap();
+        let first_row = inner.y.saturating_add(3);
+
+        // Header and search rows must not select anything.
+        assert_eq!(crate::ui::host_pick_row_at(inner, inner.y, 2), None);
+        assert_eq!(crate::ui::host_pick_row_at(inner, first_row - 1, 2), None);
+        // Beyond the visible count.
+        assert_eq!(crate::ui::host_pick_row_at(inner, first_row + 2, 2), None);
+    }
+
+    #[test]
+    fn the_picker_is_wide_enough_to_show_a_realistic_host_name() {
+        // A too-narrow modal would truncate the very thing being chosen.
+        let inner = crate::ui::host_pick_inner_rect(Rect::new(0, 0, 120, 40), 4).unwrap();
+        assert!(
+            inner.width >= 40,
+            "picker inner width {} is too narrow for host names",
+            inner.width
+        );
+    }
+
+    #[test]
+    fn a_tiny_screen_yields_no_picker_rect_instead_of_a_broken_one() {
+        assert!(crate::ui::host_pick_inner_rect(Rect::new(0, 0, 8, 3), 4).is_none());
+    }
+}
