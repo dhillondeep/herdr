@@ -44,6 +44,12 @@ pub struct HostLink {
     peer_version: u32,
 }
 
+/// How long to wait for a host to answer a handshake.
+///
+/// Bounded because this can run where a keypress is waiting: an unreachable or
+/// wedged host must fail rather than freeze the interface.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Script that starts the daemon on a host.
 ///
 /// A bare `herdr` is not enough: a non-interactive ssh command gets a minimal
@@ -68,6 +74,10 @@ impl HostLink {
         let mut child = std::process::Command::new("ssh")
             .arg("-o")
             .arg("BatchMode=yes")
+            // Fail fast on an unreachable host instead of sitting in ssh's
+            // default connect timeout.
+            .arg("-o")
+            .arg("ConnectTimeout=10")
             .arg("-o")
             .arg("ServerAliveInterval=30")
             .arg("-o")
@@ -131,7 +141,7 @@ impl HostLink {
     /// layer: the same code is driven over pipes in tests and over ssh in
     /// production, so the interesting logic is exercised without a network.
     pub fn connect<R: Read + Send + 'static>(
-        mut reader: R,
+        reader: R,
         writer: Box<dyn Write + Send>,
     ) -> std::io::Result<Self> {
         let writer = Arc::new(Mutex::new(writer));
@@ -147,16 +157,24 @@ impl HostLink {
             guard.flush()?;
         }
 
-        let peer_version = match read_frame::<_, FromHost>(&mut reader) {
-            Ok(FromHost::Welcome { version }) => version,
-            Ok(other) => {
+        // The dispatcher reads every frame including the first, and reports the
+        // welcome through a channel. That lets the handshake have a DEADLINE: a
+        // plain blocking read on a wedged host would hang the caller forever, and
+        // this runs where a keypress is waiting.
+        let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
+        let (welcome_tx, welcome_rx) = std::sync::mpsc::channel();
+        {
+            let channels = Arc::clone(&channels);
+            std::thread::spawn(move || dispatch_from_host(reader, channels, welcome_tx));
+        }
+
+        let peer_version = match welcome_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(Ok(version)) => version,
+            Ok(Err(message)) => return Err(std::io::Error::other(message)),
+            Err(_) => {
                 return Err(std::io::Error::other(format!(
-                    "expected a welcome from the host, got {other:?}"
-                )))
-            }
-            Err(err) => {
-                return Err(std::io::Error::other(format!(
-                    "host did not complete a handshake: {err}"
+                    "host did not answer within {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
                 )))
             }
         };
@@ -175,12 +193,6 @@ impl HostLink {
                     "host speaks protocol {peer}, this herdr understands up to {ours}; upgrade this herdr"
                 )))
             }
-        }
-
-        let channels: Channels = Arc::new(Mutex::new(HashMap::new()));
-        {
-            let channels = Arc::clone(&channels);
-            std::thread::spawn(move || dispatch_from_host(reader, channels));
         }
 
         Ok(Self {
@@ -266,8 +278,26 @@ impl HostLink {
 }
 
 /// Fan host frames out to the per-channel sockets the actors read from.
-fn dispatch_from_host<R: Read>(mut reader: R, channels: Channels) {
+fn dispatch_from_host<R: Read>(
+    mut reader: R,
+    channels: Channels,
+    welcome: std::sync::mpsc::Sender<Result<u32, String>>,
+) {
+    let mut welcome = Some(welcome);
+
     while let Ok(message) = read_frame::<_, FromHost>(&mut reader) {
+        // The first frame must be the welcome; anything else means the peer is
+        // not speaking this protocol and the caller should hear about it rather
+        // than waiting out the deadline.
+        if let Some(tx) = welcome.take() {
+            let _ = match &message {
+                FromHost::Welcome { version } => tx.send(Ok(*version)),
+                other => tx.send(Err(format!(
+                    "expected a welcome from the host, got {other:?}"
+                ))),
+            };
+        }
+
         match message {
             FromHost::Data { channel, bytes } => {
                 let Ok(mut map) = channels.lock() else { break };
@@ -289,6 +319,14 @@ fn dispatch_from_host<R: Read>(mut reader: R, channels: Channels) {
             }
             FromHost::Spawned { .. } | FromHost::Welcome { .. } => {}
         }
+    }
+
+    // If the link died before a welcome, unblock the caller instead of leaving it
+    // to time out.
+    if let Some(tx) = welcome.take() {
+        let _ = tx.send(Err(
+            "host closed the connection before a handshake".to_string()
+        ));
     }
 
     // The link died. Close every channel so no pane is left waiting forever on
