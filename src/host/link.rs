@@ -44,6 +44,20 @@ pub struct HostLink {
     peer_version: u32,
 }
 
+/// Script that starts the daemon on a host.
+///
+/// A bare `herdr` is not enough: a non-interactive ssh command gets a minimal
+/// PATH that excludes `~/.local/bin`, which is where herdr installs itself on a
+/// host. So try PATH first, then that location.
+///
+/// Run through `sh -c`, never a login shell: anything a profile echoes to stdout
+/// would land in front of the handshake and corrupt the framed stream. Must
+/// contain no single quotes, since it is single-quoted for the remote shell.
+const REMOTE_LAUNCH: &str = concat!(
+    "if command -v herdr >/dev/null 2>&1; then exec herdr pty-host; ",
+    "else exec \"$HOME/.local/bin/herdr\" pty-host; fi"
+);
+
 impl HostLink {
     /// Connect to a host by running `herdr pty-host` there over ssh.
     ///
@@ -61,11 +75,17 @@ impl HostLink {
             // No tty: this is a framed byte protocol, and a pty would mangle it.
             .arg("-T")
             .arg(target)
-            .arg("herdr")
-            .arg("pty-host")
+            // ONE argument, single-quoted for the remote shell. ssh joins its
+            // command arguments into a single string and hands that to the
+            // remote login shell, so passing `sh`, `-c`, `<script>` separately
+            // loses the boundaries and the shell tries to parse the script
+            // itself — zsh reports `parse error near then`.
+            .arg(format!("sh -c '{REMOTE_LAUNCH}'"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            // Captured, not discarded: when a host fails to start, ssh's own
+            // message is usually the only thing that explains why.
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
 
         let stdout = child
@@ -80,13 +100,26 @@ impl HostLink {
         match Self::connect(stdout, Box::new(stdin)) {
             Ok(link) => Ok((link, child)),
             Err(err) => {
+                // Surface what the far side said before tearing it down.
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let mut raw = Vec::new();
+                    let _ = pipe.read_to_end(&mut raw);
+                    stderr = String::from_utf8_lossy(&raw).trim().to_string();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
-                // The most common cause by far is no herdr on the remote PATH, and
-                // the raw framing error says nothing about that.
+
+                let detail = if stderr.is_empty() {
+                    // The most common cause by far is no herdr on the host.
+                    "Check that herdr is installed there, or run `herdr host probe` for detail."
+                        .to_string()
+                } else {
+                    format!("host said: {stderr}")
+                };
                 Err(std::io::Error::other(format!(
-                    "could not start herdr pty-host on {target}: {err}. \
-                     Check that herdr is installed there and on PATH."
+                    "could not start herdr pty-host on {target}: {err}. {detail}"
                 )))
             }
         }

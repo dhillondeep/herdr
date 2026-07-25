@@ -170,8 +170,9 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    // The channel fd is non-blocking, because the pane actor polls it. A reader
+    // that treats WouldBlock as fatal sees nothing at all.
     let mut stream = std::os::unix::net::UnixStream::from(fd);
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
 
     let mut seen = String::new();
     let mut buffer = [0u8; 4096];
@@ -185,6 +186,9 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
                 if seen.contains(MARKER) {
                     break;
                 }
+            }
+            Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(_) => break,
         }
