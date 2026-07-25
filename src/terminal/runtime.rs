@@ -90,6 +90,40 @@ impl TerminalRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
+        // A host-bound pane diverges here, before any local PTY is allocated.
+        // Branching at this single point means the workspace and tab layers stay
+        // unaware of hosts: they already thread the shell config through.
+        #[cfg(unix)]
+        if let Some(link) = shell_config.remote {
+            let (channel, channel_fd) = link.open_channel(crate::host::protocol::SpawnSpec {
+                // Empty argv: the host resolves its own user's login shell,
+                // since this machine's answer would be wrong.
+                argv: Vec::new(),
+                cwd: Some(cwd.display().to_string()),
+                env: launch_env.remote_entries(),
+                rows,
+                cols,
+            })?;
+            return crate::pane::PaneRuntime::spawn_remote(
+                pane_id,
+                std::sync::Arc::clone(link),
+                channel,
+                channel_fd,
+                rows,
+                cols,
+                // Cell pixel size is unknown until the first layout pass, exactly
+                // as for a local pane.
+                0,
+                0,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                events,
+                render_notify,
+                render_dirty,
+            )
+            .map(Self);
+        }
+
         crate::pane::PaneRuntime::spawn(
             pane_id,
             rows,

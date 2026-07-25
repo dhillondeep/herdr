@@ -58,6 +58,18 @@ impl App {
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
         let previous_focus = self.state.current_pane_focus_target();
+
+        // Resolved before the workspace is borrowed mutably, since opening a
+        // connection needs &mut self. A pane inherits its workspace's host: the
+        // binding is per-workspace, so a pane cannot disagree with its workspace.
+        #[cfg(unix)]
+        let host_link = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.host.clone())
+            .and_then(|host| self.host_link(&host));
+
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
@@ -66,6 +78,11 @@ impl App {
             crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
         };
         let shell_config = crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode);
+        #[cfg(unix)]
+        let shell_config = match host_link.as_ref() {
+            Some(link) => shell_config.on_host(link),
+            None => shell_config,
+        };
         let split_result = match params.ratio {
             Some(ratio) => ws.split_pane_with_ratio(
                 target_pane_id,

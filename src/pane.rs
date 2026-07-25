@@ -68,6 +68,41 @@ pub(crate) struct PaneLaunchEnv {
     identity: PaneLaunchIdentity,
 }
 
+impl PaneLaunchEnv {
+    /// Environment entries to ship to a host.
+    ///
+    /// Only what herdr sets: the local process environment is deliberately not
+    /// forwarded, since it describes the wrong machine.
+    #[cfg(unix)]
+    pub(crate) fn remote_entries(&self) -> Vec<(String, String)> {
+        let mut entries = self.extra.clone();
+        entries.push((
+            crate::HERDR_ENV_VAR.to_string(),
+            crate::HERDR_ENV_VALUE.to_string(),
+        ));
+        if let PaneLaunchIdentity::Managed {
+            workspace_id,
+            tab_id,
+            pane_id,
+        } = &self.identity
+        {
+            entries.push((
+                crate::integration::HERDR_WORKSPACE_ID_ENV_VAR.to_string(),
+                workspace_id.clone(),
+            ));
+            entries.push((
+                crate::integration::HERDR_TAB_ID_ENV_VAR.to_string(),
+                tab_id.clone(),
+            ));
+            entries.push((
+                crate::integration::HERDR_PANE_ID_ENV_VAR.to_string(),
+                pane_id.clone(),
+            ));
+        }
+        entries
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum PaneLaunchIdentity {
     #[default]
@@ -1424,6 +1459,13 @@ fn default_pane_shell() -> String {
 pub(crate) struct PaneShellConfig<'a> {
     pub(crate) default_shell: &'a str,
     pub(crate) mode: crate::config::ShellModeConfig,
+    /// When set, the pane's process runs on this host instead of locally.
+    ///
+    /// Carried here rather than as another parameter because this config is
+    /// already threaded through every spawn path, so a remote pane needs no
+    /// signature changes and no call site can forget to pass it along.
+    #[cfg(unix)]
+    pub(crate) remote: Option<&'a std::sync::Arc<crate::host::link::HostLink>>,
 }
 
 impl<'a> PaneShellConfig<'a> {
@@ -1431,7 +1473,16 @@ impl<'a> PaneShellConfig<'a> {
         Self {
             default_shell,
             mode,
+            #[cfg(unix)]
+            remote: None,
         }
+    }
+
+    /// Run this pane's process on `link`'s host.
+    #[cfg(unix)]
+    pub(crate) fn on_host(mut self, link: &'a std::sync::Arc<crate::host::link::HostLink>) -> Self {
+        self.remote = Some(link);
+        self
     }
 }
 
@@ -1629,10 +1680,6 @@ enum ImportedIo {
     LocalHandoff { child_pid: u32 },
     /// A socket to a pty-host channel. The process is on another machine, so
     /// there is no local pid and no local ioctl.
-    ///
-    /// Exercised end to end by `remote_pane_tests`; the production call site is
-    /// pane creation for a host-bound workspace, which lands next.
-    #[allow(dead_code)]
     Remote {
         link: std::sync::Arc<crate::host::link::HostLink>,
         channel: crate::host::protocol::ChannelId,
@@ -1920,9 +1967,6 @@ impl PaneRuntime {
     /// drive it. Window size goes over the link instead of through an ioctl.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
-    // Called by remote_pane_tests today; pane creation for a host-bound workspace
-    // is the remaining wiring.
-    #[allow(dead_code)]
     pub fn spawn_remote(
         pane_id: PaneId,
         link: std::sync::Arc<crate::host::link::HostLink>,

@@ -160,7 +160,6 @@ impl HostLink {
 
     /// Protocol version the host advertised. Surfaced for diagnostics: with many
     /// hosts, version skew is the failure people hit most.
-    #[allow(dead_code)]
     pub fn peer_version(&self) -> u32 {
         self.peer_version
     }

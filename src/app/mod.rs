@@ -94,8 +94,19 @@ impl PaneClickState {
     }
 }
 
+/// A live connection to a host, plus the ssh process carrying it. The child is
+/// held so dropping the connection tears the transport down too.
+#[cfg(unix)]
+pub(crate) struct HostConnection {
+    pub(crate) link: std::sync::Arc<crate::host::link::HostLink>,
+    _ssh: std::process::Child,
+}
+
 pub struct App {
     pub state: AppState,
+    /// Connections opened on demand, one per host, shared by all its panes.
+    #[cfg(unix)]
+    pub(crate) host_links: std::collections::HashMap<crate::host::HostId, HostConnection>,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
@@ -228,6 +239,47 @@ fn auto_updates_enabled(no_session: bool) -> bool {
 /// the resulting event would perturb tests that assert on the internal event
 /// queue, and tests should not spawn subprocesses. Unlike auto-update it stays
 /// enabled in debug builds, so the feature is usable while developing.
+impl App {
+    /// Get or open the connection for a host.
+    ///
+    /// Opened on first use and shared by every pane on that host, so a workspace
+    /// with several panes costs one ssh connection.
+    ///
+    /// Connecting is synchronous, which means the first pane on a host pays the
+    /// ssh handshake. That is a visible stall and should move to a background
+    /// connect with the pane showing a connecting state; doing it here first keeps
+    /// the change reviewable.
+    #[cfg(unix)]
+    pub(crate) fn host_link(
+        &mut self,
+        host: &crate::host::HostId,
+    ) -> Option<std::sync::Arc<crate::host::link::HostLink>> {
+        if let Some(existing) = self.host_links.get(host) {
+            return Some(std::sync::Arc::clone(&existing.link));
+        }
+
+        match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
+            Ok((link, ssh)) => {
+                let link = std::sync::Arc::new(link);
+                self.host_links.insert(
+                    host.clone(),
+                    HostConnection {
+                        link: std::sync::Arc::clone(&link),
+                        _ssh: ssh,
+                    },
+                );
+                Some(link)
+            }
+            Err(err) => {
+                // Surfaced rather than silently falling back to a local pane: a
+                // pane quietly running on the wrong machine is worse than none.
+                tracing::warn!(host = %host, err = %err, "could not connect to host");
+                None
+            }
+        }
+    }
+}
+
 fn host_discovery_enabled(no_session: bool) -> bool {
     !no_session && !cfg!(test)
 }
@@ -752,6 +804,8 @@ impl App {
             copy_feedback_deadline: None,
             last_api_notification_at: None,
             state,
+            #[cfg(unix)]
+            host_links: std::collections::HashMap::new(),
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
