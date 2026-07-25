@@ -98,6 +98,18 @@ pub struct MatchedRule {
     pub state: AgentState,
 }
 
+impl MatchedRule {
+    /// What kind of attention this match implies, for a blocked state.
+    ///
+    /// `None` unless the state is actually Blocked: an idle or working rule has no
+    /// blocker kind, and inventing one would put agents in a queue that nothing is
+    /// waiting on.
+    pub fn blocker_kind(&self) -> Option<crate::detect::BlockerKind> {
+        (self.state == AgentState::Blocked)
+            .then(|| crate::detect::blocker_kind_from_rule_id(&self.id))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatedRule {
     pub id: String,
@@ -803,6 +815,9 @@ pub fn explain_to_json_value(explain: &DetectionExplain) -> serde_json::Value {
             "priority": rule.priority,
             "region": rule.region,
             "state": agent_state_label(rule.state),
+            // Only present for a blocked match, and "unknown" when the rule does
+            // not say what kind of attention it needs.
+            "blocker_kind": rule.blocker_kind().map(|kind| kind.as_str()),
         })
     });
     let evaluated_rules: Vec<_> = explain

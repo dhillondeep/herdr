@@ -175,6 +175,11 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
                 .and_then(|value| value.as_i64())
                 .unwrap_or(0),
         );
+        // Only printed when the rule is a blocker, so an idle match does not gain
+        // a meaningless line.
+        if let Some(kind) = rule.get("blocker_kind").and_then(|value| value.as_str()) {
+            println!("needs: {kind}");
+        }
         if let Some(preview) = matched_rule_region_preview(explain, rule_id) {
             println!("evidence: {preview:?}");
         }

@@ -38,6 +38,67 @@ pub struct AgentDetection {
     pub visible_working: bool,
 }
 
+/// What kind of attention a blocked agent needs.
+///
+/// A permission prompt is a two-second keystroke; an open question is a
+/// two-minute think. Ranking them together is why a long list of blocked agents
+/// is hard to work through — the cheap ones should be dispatchable first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BlockerKind {
+    /// Approve or deny something the agent wants to do.
+    Permission,
+    /// An open question needing a considered answer.
+    Question,
+    /// Choose from a list the agent is showing.
+    Selection,
+    /// Blocked, but the rule does not say how. Deliberately not guessed.
+    Unknown,
+}
+
+impl BlockerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permission => "permission",
+            Self::Question => "question",
+            Self::Selection => "selection",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify a blocked rule by its id.
+///
+/// The manifests already encode the category in some rule ids, so this reads what
+/// is there rather than adding new screen matching — no new detection behaviour,
+/// and no need for the live screen evidence `AGENTS.md` requires when changing how
+/// rules match.
+///
+/// Deliberately conservative. `permission_hints_blocked` and
+/// `question_dialog_hints_blocked` are unambiguous, but `confirmation_or_input_blocker`
+/// spans both and `weak_blocker` says nothing at all. Those stay `Unknown`:
+/// mis-ranking an agent is worse than admitting the rule does not know, because a
+/// question filed as a quick permission wastes the exact attention this is meant
+/// to save.
+pub fn blocker_kind_from_rule_id(rule_id: &str) -> BlockerKind {
+    let id = rule_id.to_ascii_lowercase();
+
+    // Order matters: an id naming both is ambiguous, so check the ambiguous
+    // combination before either single term.
+    if id.contains("confirmation_or_input") {
+        return BlockerKind::Unknown;
+    }
+    if id.contains("permission") {
+        return BlockerKind::Permission;
+    }
+    if id.contains("question") {
+        return BlockerKind::Question;
+    }
+    if id.contains("selection") || id.contains("option_dialog") {
+        return BlockerKind::Selection;
+    }
+    BlockerKind::Unknown
+}
+
 /// Which agent we detected running in a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agent {
@@ -1305,5 +1366,124 @@ mod tests {
         let tpgid: i32 = fields[5].parse().expect("tpgid should be a number");
         // In CI/test environments without a terminal, tpgid is typically -1
         let _ = tpgid;
+    }
+}
+
+#[cfg(test)]
+mod blocker_kind_tests {
+    use super::*;
+
+    // Every id below is taken verbatim from src/detect/manifests/*.toml, so this
+    // tests the classification against what the manifests actually contain rather
+    // than against ids invented to fit the code.
+
+    #[test]
+    fn real_permission_and_question_rules_classify() {
+        assert_eq!(
+            blocker_kind_from_rule_id("permission_hints_blocked"),
+            BlockerKind::Permission
+        );
+        assert_eq!(
+            blocker_kind_from_rule_id("question_dialog_hints_blocked"),
+            BlockerKind::Question
+        );
+    }
+
+    #[test]
+    fn real_selection_rules_classify() {
+        for id in [
+            "selection_blocker",
+            "selection_menu_blocker",
+            "execute_selection_blocker",
+            "option_dialog_blocked",
+        ] {
+            assert_eq!(
+                blocker_kind_from_rule_id(id),
+                BlockerKind::Selection,
+                "{id} should read as a selection"
+            );
+        }
+    }
+
+    #[test]
+    fn genuinely_ambiguous_rules_stay_unknown() {
+        // These exist in the manifests and do not say what kind of attention they
+        // need. Guessing would rank a two-minute question as a two-second
+        // keystroke, which wastes exactly the attention this is meant to save.
+        for id in [
+            "confirmation_or_input_blocker",
+            "weak_blocker",
+            "live_strong_blocker",
+            "live_blocked_form",
+            "osc_title_blocked",
+            "legacy_no_prompt_blocker",
+        ] {
+            assert_eq!(
+                blocker_kind_from_rule_id(id),
+                BlockerKind::Unknown,
+                "{id} must not be guessed at"
+            );
+        }
+    }
+
+    #[test]
+    fn an_id_naming_both_permission_and_input_is_not_read_as_permission() {
+        // Order-dependent: a naive "contains permission" check applied first would
+        // misclassify a rule that spans both.
+        assert_eq!(
+            blocker_kind_from_rule_id("confirmation_or_input_permission_blocker"),
+            BlockerKind::Unknown
+        );
+    }
+
+    #[test]
+    fn classification_ignores_case() {
+        assert_eq!(
+            blocker_kind_from_rule_id("PERMISSION_HINTS_BLOCKED"),
+            BlockerKind::Permission
+        );
+    }
+
+    #[test]
+    fn cheap_attention_sorts_before_expensive_attention() {
+        // The ordering is the point: permission before question, and unclassified
+        // last so it never crowds out a known-cheap item.
+        let mut kinds = vec![
+            BlockerKind::Unknown,
+            BlockerKind::Question,
+            BlockerKind::Permission,
+            BlockerKind::Selection,
+        ];
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockerKind::Permission,
+                BlockerKind::Question,
+                BlockerKind::Selection,
+                BlockerKind::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_blocked_rule_has_a_blocker_kind() {
+        // An idle or working match must not acquire one, or agents would appear in
+        // a queue nothing is waiting on.
+        let blocked = crate::detect::manifest::MatchedRule {
+            id: "permission_hints_blocked".to_string(),
+            priority: 10,
+            region: "detection".to_string(),
+            state: AgentState::Blocked,
+        };
+        assert_eq!(blocked.blocker_kind(), Some(BlockerKind::Permission));
+
+        let idle = crate::detect::manifest::MatchedRule {
+            id: "permission_hints_blocked".to_string(),
+            priority: 10,
+            region: "detection".to_string(),
+            state: AgentState::Idle,
+        };
+        assert_eq!(idle.blocker_kind(), None);
     }
 }
