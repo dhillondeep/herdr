@@ -890,8 +890,13 @@ fn dispatch_from_host(
                 // gone for good. Reset the parser and say so in the pane: silently
                 // continuing would put a hole in the middle of what the user reads
                 // as real output.
-                resync(&shared, channel, out_offset);
-                note_resume(&shared, channel, PaneResume::Truncated);
+                if resync(&shared, channel, out_offset) {
+                    note_resume(&shared, channel, PaneResume::Truncated);
+                } else {
+                    // Live output had already carried us past the point the host
+                    // resynced to, so nothing was lost here.
+                    note_resume(&shared, channel, PaneResume::Resumed);
+                }
             }
             FromHost::Gone { channel, reason } => {
                 match reason {
@@ -932,15 +937,50 @@ fn dispatch_from_host(
     }
 }
 
-/// Write one positioned run of output to a channel's actor, reconciling it against
-/// what has already been delivered.
+/// What to do with a positioned run of output, given where the parser has reached.
 ///
-/// Every case here is a real one. An overlap happens because answering an
-/// `Attach` is not atomic with respect to output still being produced, so a
-/// `Replay` and a live `Data` frame can cover the same bytes. A gap should be
-/// impossible over a stream transport, which is exactly why it must be handled:
-/// if one ever occurs it is a bug, and feeding it to the parser would corrupt the
-/// grid silently rather than reporting anything.
+/// Separated from the writing so the arithmetic can be tested without a socket.
+/// An off-by-one here is silent, unreproducible grid corruption — the one failure
+/// mode in this whole path that leaves no trace to debug from — so it is the part
+/// that most needs to be reachable by a property test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reconciled {
+    /// Every byte in the frame has already been given to the parser.
+    AlreadySeen,
+    /// Write the frame from `skip` onwards; the parser then stands at `next`.
+    Write { skip: usize, next: u64 },
+    /// `missing` bytes between the parser and this frame will never arrive. Reset,
+    /// mark, then write the whole frame; the parser then stands at `next`.
+    Gap { missing: u64, next: u64 },
+}
+
+/// Decide how a frame at `from` relates to a parser that has consumed `delivered`
+/// bytes of this stream.
+///
+/// Every case is a real one. An overlap happens because answering an `Attach` is
+/// not atomic with respect to output still being produced, so a `Replay` and a
+/// live `Data` frame can cover the same bytes. A gap should be impossible over a
+/// stream transport, which is exactly why it is handled: if one ever occurs it is a
+/// bug, and feeding it to the parser would corrupt the grid silently rather than
+/// reporting anything at all.
+pub(super) fn reconcile(delivered: u64, from: u64, len: usize) -> Reconciled {
+    let next = from.saturating_add(len as u64);
+    if next <= delivered {
+        return Reconciled::AlreadySeen;
+    }
+    if from > delivered {
+        return Reconciled::Gap {
+            missing: from - delivered,
+            next,
+        };
+    }
+    Reconciled::Write {
+        skip: (delivered - from) as usize,
+        next,
+    }
+}
+
+/// Write one positioned run of output to a channel's actor.
 fn deliver(shared: &Arc<Shared>, channel: ChannelId, from: u64, bytes: &[u8]) {
     let Ok(mut map) = shared.channels.lock() else {
         return;
@@ -949,19 +989,10 @@ fn deliver(shared: &Arc<Shared>, channel: ChannelId, from: u64, bytes: &[u8]) {
         return;
     };
 
-    let frame_end = from.saturating_add(bytes.len() as u64);
-    if frame_end <= end.out_offset {
-        // Entirely bytes we have already given the parser.
-        return;
-    }
-
-    let mut gap = 0u64;
-    let payload: &[u8] = if from > end.out_offset {
-        gap = from - end.out_offset;
-        bytes
-    } else {
-        let already = (end.out_offset - from) as usize;
-        &bytes[already..]
+    let (payload, next, gap) = match reconcile(end.out_offset, from, bytes.len()) {
+        Reconciled::AlreadySeen => return,
+        Reconciled::Write { skip, next } => (&bytes[skip..], next, 0),
+        Reconciled::Gap { missing, next } => (bytes, next, missing),
     };
 
     if gap > 0 {
@@ -981,7 +1012,7 @@ fn deliver(shared: &Arc<Shared>, channel: ChannelId, from: u64, bytes: &[u8]) {
         map.remove(&channel);
         return;
     }
-    end.out_offset = frame_end;
+    end.out_offset = next;
     if gap > 0 {
         drop(map);
         note_resume(shared, channel, PaneResume::Truncated);
@@ -989,14 +1020,28 @@ fn deliver(shared: &Arc<Shared>, channel: ChannelId, from: u64, bytes: &[u8]) {
 }
 
 /// Handle a `Desync`: the host cannot catch this pane up without a hole.
-fn resync(shared: &Arc<Shared>, channel: ChannelId, host_offset: u64) {
+///
+/// Returns whether anything was actually lost, so the caller only records a
+/// truncation that happened.
+fn resync(shared: &Arc<Shared>, channel: ChannelId, host_offset: u64) -> bool {
     let Ok(mut map) = shared.channels.lock() else {
-        return;
+        return false;
     };
     let Some(end) = map.get_mut(&channel) else {
-        return;
+        return false;
     };
-    let missing = host_offset.saturating_sub(end.out_offset);
+
+    // The host reports where the live stream stood when it answered the attach,
+    // and output kept being produced while that answer was in flight — so a live
+    // frame can carry the parser PAST this point before the answer arrives. Taking
+    // the reported offset unconditionally would then move the cursor BACKWARDS and
+    // re-deliver bytes the parser already has. Whatever gap existed was reported by
+    // `deliver` when it saw that frame jump ahead, so there is nothing left to say.
+    if host_offset <= end.out_offset {
+        return false;
+    }
+
+    let missing = host_offset - end.out_offset;
     end.truncated = true;
     // Jump to where the live stream is, so the frames that follow line up instead
     // of each looking like a fresh gap.
@@ -1007,6 +1052,7 @@ fn resync(shared: &Arc<Shared>, channel: ChannelId, host_offset: u64) {
     if end.local.write_all(&notice).is_err() {
         map.remove(&channel);
     }
+    true
 }
 
 /// Text the user sees where output was lost.
@@ -1660,6 +1706,85 @@ mod tests {
             cols: 80,
         });
         assert!(result.is_err(), "should refuse while disconnected");
+    }
+
+    #[test]
+    fn reconcile_covers_every_relation_a_frame_can_have_to_the_cursor() {
+        // Direct rather than only through the schedule: the daemon now orders a
+        // channel's frames strictly, so a *partial* overlap — a frame that starts
+        // behind the cursor and ends ahead of it — cannot be produced by a correct
+        // host at all. That makes it exactly the branch a property test cannot
+        // reach and the one most likely to rot, so it is pinned here.
+        assert_eq!(reconcile(0, 0, 0), Reconciled::AlreadySeen);
+        assert_eq!(reconcile(10, 0, 10), Reconciled::AlreadySeen);
+        assert_eq!(reconcile(10, 4, 3), Reconciled::AlreadySeen);
+        assert_eq!(
+            reconcile(0, 0, 5),
+            Reconciled::Write { skip: 0, next: 5 },
+            "a frame exactly at the cursor is written whole"
+        );
+        assert_eq!(
+            reconcile(10, 10, 5),
+            Reconciled::Write { skip: 0, next: 15 }
+        );
+        assert_eq!(
+            reconcile(10, 4, 12),
+            Reconciled::Write { skip: 6, next: 16 },
+            "a partial overlap keeps only the unseen suffix"
+        );
+        assert_eq!(
+            reconcile(10, 12, 4),
+            Reconciled::Gap {
+                missing: 2,
+                next: 16
+            },
+            "a frame ahead of the cursor leaves a hole that must be reported"
+        );
+    }
+
+    #[test]
+    fn a_desync_behind_the_cursor_is_ignored_rather_than_obeyed() {
+        // The host reports where the stream stood when it answered; live output can
+        // carry the parser past that point while the answer is in flight. Obeying it
+        // would wind the cursor BACK and re-deliver bytes the parser already has,
+        // and it would print a truncation marker for nothing.
+        let (link, _hosts, mut host) = connect_link(1);
+        let (channel, mut actor) = open_pane(&link, &mut host);
+        host_send(
+            &mut host,
+            &FromHost::Data {
+                channel,
+                from: 0,
+                bytes: b"0123456789".to_vec(),
+            },
+        );
+        assert_eq!(read_until(&mut actor, "0123456789"), "0123456789");
+
+        host_send(
+            &mut host,
+            &FromHost::Desync {
+                channel,
+                available_from: 0,
+                out_offset: 4,
+            },
+        );
+        assert!(
+            drain(&mut actor, Duration::from_millis(300)).is_empty(),
+            "a stale desync must produce neither a marker nor a re-delivery"
+        );
+        assert!(!link.channel_truncated(channel), "nothing was lost");
+
+        // And the cursor really did stay put: the next live frame lines up.
+        host_send(
+            &mut host,
+            &FromHost::Data {
+                channel,
+                from: 10,
+                bytes: b"onwards".to_vec(),
+            },
+        );
+        let tail = String::from_utf8(drain(&mut actor, Duration::from_millis(300))).unwrap();
+        assert_eq!(tail, "onwards", "cursor moved: {tail:?}");
     }
 
     #[test]

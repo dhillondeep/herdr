@@ -409,6 +409,100 @@ fn next_for_channel(stream: &mut UnixStream, channel: u64) -> FromHost {
 }
 
 #[test]
+fn no_live_output_reaches_a_reattached_client_before_its_resume_answer() {
+    // The ordering that lets the client trust its own cursor. A pane produces
+    // output continuously, so on reconnect there is a live frame ready to go at the
+    // same moment as the replay. If the live frame went first it would land ahead of
+    // the client's cursor and be read as a gap — a "bytes were lost" marker for
+    // bytes that were arriving in the very next frame. The daemon therefore holds a
+    // channel's live output until that channel has been answered.
+    let socket = scratch("attach-order");
+    let heartbeat = scratch("attach-order-beat");
+    let _ = std::fs::remove_file(&heartbeat);
+
+    let daemon = Daemon::start(socket.clone());
+    let (mut first, epoch) = daemon.connect_with_epoch();
+    spawn_heartbeat(&mut first, 1, &heartbeat);
+    // Read enough that the client is genuinely behind when it leaves.
+    std::thread::sleep(Duration::from_millis(400));
+    drop(first);
+
+    // Keep producing with nobody attached, so the log has a backlog and the reader
+    // thread is actively trying to send.
+    std::thread::sleep(Duration::from_millis(700));
+
+    let mut second = daemon.connect();
+
+    // The attach is deliberately delayed rather than sent at once. Racing it
+    // against the pane's own timing would make this test pass or fail by luck; a
+    // held-back attach turns the same question into a deterministic one — during
+    // this window the pane is definitely producing output (it ticks every 100ms),
+    // so if any of it arrives, the gate is not working.
+    second
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("read timeout");
+    // Bounded by a deadline as well as by the per-read timeout, and it stops at the
+    // first offending frame. Draining until the reads dry up would never terminate
+    // when the gate is broken, because a pane that ticks faster than the timeout
+    // keeps the loop fed — the failing case has to finish too.
+    let window = Instant::now() + Duration::from_millis(600);
+    let mut early = None;
+    while Instant::now() < window && early.is_none() {
+        match client::read::<_, FromHost>(&mut second) {
+            Ok(FromHost::Data {
+                channel: 1, from, ..
+            }) => early = Some(from),
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    assert!(
+        early.is_none(),
+        "live output must not reach a client that has not been told where to resume \
+         from; got a frame at offset {early:?}"
+    );
+
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    client::write(
+        &mut second,
+        &ToHost::Attach {
+            host_epoch: epoch,
+            panes: vec![(1, 0)],
+        },
+    )
+    .expect("attach");
+
+    // And the answer, when it comes, is the first thing about this channel.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut first_for_channel = None;
+    while Instant::now() < deadline && first_for_channel.is_none() {
+        match client::read::<_, FromHost>(&mut second) {
+            Ok(message) => match &message {
+                FromHost::Data { channel: 1, .. }
+                | FromHost::Replay { channel: 1, .. }
+                | FromHost::Desync { channel: 1, .. }
+                | FromHost::Gone { channel: 1, .. } => first_for_channel = Some(message),
+                _ => continue,
+            },
+            Err(_) => break,
+        }
+    }
+
+    match first_for_channel.expect("something for channel 1") {
+        FromHost::Replay { from, bytes, .. } => {
+            assert_eq!(from, 0);
+            // Everything produced during the wait is in the replay, not lost.
+            assert!(!bytes.is_empty(), "the held-back output must be replayed");
+        }
+        other => panic!("the resume answer must come first, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&heartbeat);
+}
+
+#[test]
 fn reattaching_with_a_current_offset_replays_what_was_missed() {
     let socket = scratch("resume-ok");
     let heartbeat = scratch("resume-ok-beat");

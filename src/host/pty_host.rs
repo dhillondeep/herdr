@@ -48,6 +48,19 @@ struct OutputLog {
     end: u64,
     buffer: std::collections::VecDeque<u8>,
     capacity: usize,
+    /// Whether live output for this channel may go to the attached client yet.
+    ///
+    /// Cleared when a client goes away and set again only when that channel has
+    /// been answered in an `Attach`. Without it a reconnecting client can receive a
+    /// live frame from beyond its offset *before* the replay that would have filled
+    /// the space, and report a gap for bytes that were about to arrive — a marker
+    /// claiming loss where there was none, which is worse than no marker at all
+    /// because it teaches the user to distrust the real ones.
+    ///
+    /// Lives in the log, and is read and written under the log's own lock, because
+    /// that lock is also what orders appends against sends: the check and the append
+    /// happen together, so no byte can fall between the two.
+    ready: bool,
 }
 
 impl OutputLog {
@@ -57,6 +70,9 @@ impl OutputLog {
             end: 0,
             buffer: std::collections::VecDeque::new(),
             capacity,
+            // A freshly spawned channel needs no attach: the client has known about
+            // it from its first byte.
+            ready: true,
         }
     }
 
@@ -243,6 +259,18 @@ fn serve_client<R: Read>(
         *guard = None;
     }
 
+    // Every surviving channel must be re-attached before its output resumes. The
+    // next client does not know where these panes got to, so a live frame sent
+    // before it has been told would land ahead of its cursor and read as lost
+    // output. The bytes are not dropped — they accumulate in each channel's log,
+    // which is what the replay is drawn from.
+    if let Ok(map) = daemon.channels.lock() {
+        for entry in map.values() {
+            let mut log = entry.log.lock().unwrap_or_else(|err| err.into_inner());
+            log.ready = false;
+        }
+    }
+
     Ok(())
 }
 
@@ -299,52 +327,71 @@ fn handle(
         ToHost::Shutdown { channel } => shutdown_channel(channels, channel),
         ToHost::Attach { host_epoch, panes } => {
             for (channel, offset) in panes {
-                send(
-                    out,
-                    &resume_decision(daemon_epoch, host_epoch, channels, channel, offset),
-                );
+                answer_attach(out, channels, daemon_epoch, host_epoch, channel, offset);
             }
         }
     }
 }
 
-/// Decide, for one pane, whether a reconnecting client can resume.
+/// Answer, for one pane, whether a reconnecting client can resume — and let its
+/// live output start flowing again.
 ///
 /// Exactly one answer per pane, and the epoch is checked first: if the daemon
 /// restarted then nothing from the previous epoch survived, so offsets are
 /// meaningless and every pane is gone regardless of how far behind the client is.
 /// Checking offsets first would let a coincidental match resume a pane whose agent
 /// no longer exists, which is the worst outcome available here.
-fn resume_decision(
+///
+/// The answer is computed and sent while holding the channel's log lock, and the
+/// gate on live output is opened before releasing it. That is what guarantees the
+/// client sees the answer *before* any live frame for that pane: the reader thread
+/// takes the same lock to append and send, so it either ran entirely before this
+/// (its bytes are in the replay) or entirely after (its bytes follow the replay).
+/// There is no third interleaving, which is why the client never has to guess
+/// whether a frame ahead of its cursor is a gap or an overtaken replay.
+fn answer_attach(
+    out: &SharedOut,
+    channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>,
     daemon_epoch: u64,
     client_epoch: u64,
-    channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>,
     channel: ChannelId,
     offset: u64,
-) -> FromHost {
+) {
     if client_epoch != daemon_epoch {
-        return FromHost::Gone {
-            channel,
-            reason: crate::host::protocol::GoneReason::HostRestarted,
-        };
+        send(
+            out,
+            &FromHost::Gone {
+                channel,
+                reason: crate::host::protocol::GoneReason::HostRestarted,
+            },
+        );
+        return;
     }
 
-    let Some((bytes, start, end)) = channels.lock().ok().and_then(|map| {
-        let entry = map.get(&channel)?;
-        // Poison recovered, not treated as absence: reporting a live pane as `Gone`
-        // would tell the user their agent died when it is still running.
-        let log = entry.log.lock().unwrap_or_else(|err| err.into_inner());
-        Some((log.since(offset), log.start, log.end))
-    }) else {
+    // The log handle is cloned out so the channel table is not held while the log
+    // is: one lock at a time keeps the order here trivially consistent with the
+    // reader thread's.
+    let log = channels
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&channel).map(|entry| Arc::clone(&entry.log)));
+    let Some(log) = log else {
         // Same epoch but no such channel: its process finished while the client was
         // away.
-        return FromHost::Gone {
-            channel,
-            reason: crate::host::protocol::GoneReason::ChildExited,
-        };
+        send(
+            out,
+            &FromHost::Gone {
+                channel,
+                reason: crate::host::protocol::GoneReason::ChildExited,
+            },
+        );
+        return;
     };
 
-    match bytes {
+    // Poison recovered, not treated as absence: reporting a live pane as `Gone`
+    // would tell the user their agent died when it is still running.
+    let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+    let answer = match log.since(offset) {
         Some(bytes) => FromHost::Replay {
             channel,
             from: offset,
@@ -352,10 +399,12 @@ fn resume_decision(
         },
         None => FromHost::Desync {
             channel,
-            available_from: start,
-            out_offset: end,
+            available_from: log.start,
+            out_offset: log.end,
         },
-    }
+    };
+    send(out, &answer);
+    log.ready = true;
 }
 
 fn spawn_channel(
@@ -411,29 +460,36 @@ fn spawn_channel(
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // Recorded before sending, so output produced while nobody
-                        // is attached is still replayable afterwards. The offset the
-                        // log assigns is the one that goes on the wire, so the
-                        // client's idea of the stream and the log's cannot drift —
-                        // deriving the position on either side independently is how
-                        // an off-by-one becomes silent grid corruption.
-                        let from = {
-                            // Recovered rather than propagated: a poisoned log must
-                            // not stop a live pane's output, and `append` is the only
-                            // mutator so no panic can leave the offsets inconsistent.
-                            let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
-                            let from = log.end;
-                            log.append(&buffer[..n]);
-                            from
-                        };
-                        send(
-                            &out,
-                            &FromHost::Data {
-                                channel,
-                                from,
-                                bytes: buffer[..n].to_vec(),
-                            },
-                        );
+                        // Recorded before sending, so output produced while nobody is
+                        // attached is still replayable afterwards. The offset the log
+                        // assigns is the one that goes on the wire, so the client's
+                        // idea of the stream and the log's cannot drift — deriving
+                        // the position on either side independently is how an
+                        // off-by-one becomes silent grid corruption.
+                        //
+                        // The lock is held across the send as well, which is what
+                        // makes this channel's wire order identical to its log order.
+                        // Appending under the lock and sending outside it would let
+                        // two chunks reach the client reversed, and a reversed pair
+                        // reads as a gap followed by stale bytes.
+                        //
+                        // Poison is recovered rather than propagated: it must not stop
+                        // a live pane's output, and `append` is the only mutator so no
+                        // panic can leave the offsets inconsistent.
+                        let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+                        let from = log.end;
+                        log.append(&buffer[..n]);
+                        if log.ready {
+                            send(
+                                &out,
+                                &FromHost::Data {
+                                    channel,
+                                    from,
+                                    bytes: buffer[..n].to_vec(),
+                                },
+                            );
+                        }
+                        drop(log);
                     }
                 }
             }
@@ -703,6 +759,224 @@ pub fn run() -> std::io::Result<()> {
 #[cfg(test)]
 mod output_log_tests {
     use super::*;
+
+    /// Deterministic PRNG, so a schedule that fails is reproducible from its seed.
+    /// `rand` is not a dependency and this does not need to be good randomness —
+    /// only varied and repeatable.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Models the client's VT parser: what was fed to it, and where it was told
+    /// output had been lost.
+    struct Parser {
+        /// `Some(byte)` at every stream offset that reached the parser.
+        seen: Vec<Option<u8>>,
+        /// Ranges the user was told about, as `[start, end)`.
+        gaps: Vec<(u64, u64)>,
+        delivered: u64,
+    }
+
+    impl Parser {
+        fn new() -> Self {
+            Self {
+                seen: Vec::new(),
+                gaps: Vec::new(),
+                delivered: 0,
+            }
+        }
+
+        /// Apply one positioned frame exactly as the link's `deliver` would.
+        fn apply(&mut self, produced: &[u8], from: u64, len: usize) {
+            match crate::host::link::reconcile(self.delivered, from, len) {
+                crate::host::link::Reconciled::AlreadySeen => {}
+                crate::host::link::Reconciled::Write { skip, next } => {
+                    self.write(produced, from + skip as u64, next);
+                }
+                crate::host::link::Reconciled::Gap { missing, next } => {
+                    assert!(
+                        missing > 0,
+                        "a gap of nothing would put a marker in the pane for no reason"
+                    );
+                    self.gaps.push((self.delivered, from));
+                    self.delivered = from;
+                    self.write(produced, from, next);
+                }
+            }
+        }
+
+        /// Apply a `Desync`: the host cannot close the gap, so it says where the
+        /// live stream is and the client jumps there.
+        ///
+        /// A report that is already behind the parser is ignored rather than obeyed.
+        /// Live output can carry the parser past the point the host resynced to
+        /// while the answer is still in flight, and jumping backwards would
+        /// re-deliver bytes the parser already has.
+        fn desync(&mut self, host_end: u64) {
+            if host_end <= self.delivered {
+                return;
+            }
+            self.gaps.push((self.delivered, host_end));
+            self.delivered = host_end;
+        }
+
+        fn write(&mut self, produced: &[u8], from: u64, next: u64) {
+            if next as usize > self.seen.len() {
+                self.seen.resize(next as usize, None);
+            }
+            for offset in from..next {
+                // The single strongest check here: a byte handed to the parser
+                // twice is duplicated output on screen, and it is exactly what an
+                // off-by-one in the overlap trim produces.
+                assert!(
+                    self.seen[offset as usize].is_none(),
+                    "offset {offset} delivered twice"
+                );
+                self.seen[offset as usize] = Some(produced[offset as usize]);
+            }
+            self.delivered = next;
+        }
+    }
+
+    /// Produce a chunk the way the daemon does: into the log first, taking the
+    /// offset the log assigns rather than deriving it separately.
+    fn produce(rng: &mut Rng, log: &mut OutputLog, produced: &mut Vec<u8>) -> (u64, usize) {
+        let len = 1 + rng.below(24) as usize;
+        let from = log.end;
+        let chunk: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+        log.append(&chunk);
+        produced.extend_from_slice(&chunk);
+        (from, len)
+    }
+
+    #[test]
+    fn every_schedule_delivers_the_stream_exactly_or_reports_the_hole() {
+        // The invariant the whole resume design rests on, stated as sharply as it
+        // can be: for ANY interleaving of production, disconnection and replay, the
+        // bytes the parser received partition the delivered range into runs that
+        // match what the PTY produced and runs that were reported as lost. Nothing
+        // else. A third outcome — a hole nobody was told about — is permanent grid
+        // corruption with no trace left to debug from.
+        //
+        // The log is deliberately tiny so overflow, and therefore Desync, is the
+        // common case rather than a corner one.
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut log = OutputLog::new(1 + rng.below(96) as usize);
+            let mut produced: Vec<u8> = Vec::new();
+            let mut parser = Parser::new();
+            let mut attached = true;
+
+            for _ in 0..40 {
+                match rng.below(10) {
+                    0..=5 => {
+                        let (from, len) = produce(&mut rng, &mut log, &mut produced);
+                        if attached {
+                            parser.apply(&produced, from, len);
+                        }
+                    }
+                    6..=7 => attached = false,
+                    _ => {
+                        if attached {
+                            continue;
+                        }
+                        // Reattach. The daemon answers from the offset the client
+                        // asked about, and live output keeps being produced while
+                        // that answer is in flight — so the answer can land
+                        // *between* two live frames and partly cover ground the
+                        // client has already taken. That is the case the position on
+                        // every frame exists for, so the schedule has to reach it:
+                        // the racing frames are split either side of the answer
+                        // rather than all placed before it, because putting them all
+                        // first only ever produces an answer that is wholly behind.
+                        let asked = parser.delivered;
+                        let answer = log.since(asked);
+                        let answer_covers = log.end;
+                        attached = true;
+
+                        let racing = rng.below(3);
+                        let before = rng.below(racing + 1);
+                        let mut pending = Vec::new();
+                        for index in 0..racing {
+                            let frame = produce(&mut rng, &mut log, &mut produced);
+                            if index < before {
+                                parser.apply(&produced, frame.0, frame.1);
+                            } else {
+                                pending.push(frame);
+                            }
+                        }
+
+                        match answer {
+                            Some(bytes) => parser.apply(&produced, asked, bytes.len()),
+                            None => parser.desync(answer_covers),
+                        }
+                        for (from, len) in pending {
+                            parser.apply(&produced, from, len);
+                        }
+
+                        // Whether by replay or by being told to resync, a reattach
+                        // must leave the client fully caught up. Without this a
+                        // replay that silently returns nothing looks like success:
+                        // no gap is reported, no wrong byte is delivered, and the
+                        // pane simply stops updating.
+                        assert_eq!(
+                            parser.delivered, log.end,
+                            "seed {seed}: reattach left the client behind"
+                        );
+                    }
+                }
+            }
+
+            // Every delivered byte is the byte the PTY produced there.
+            let mut written = 0u64;
+            for (offset, cell) in parser.seen.iter().enumerate() {
+                if let Some(byte) = cell {
+                    assert_eq!(
+                        *byte, produced[offset],
+                        "seed {seed}: wrong byte at offset {offset}"
+                    );
+                    written += 1;
+                }
+            }
+
+            // Gaps are non-empty, ordered and disjoint.
+            let mut previous_end = 0u64;
+            let mut lost = 0u64;
+            for (start, end) in &parser.gaps {
+                assert!(end > start, "seed {seed}: empty gap {start}..{end}");
+                assert!(
+                    *start >= previous_end,
+                    "seed {seed}: overlapping gaps at {start}"
+                );
+                previous_end = *end;
+                lost += end - start;
+            }
+
+            // And the two account for the consumed range exactly. If this holds
+            // there is no hole the user was not told about, and nothing was shown
+            // twice.
+            assert_eq!(
+                written + lost,
+                parser.delivered,
+                "seed {seed}: {written} delivered + {lost} reported lost != {} consumed",
+                parser.delivered
+            );
+        }
+    }
 
     #[test]
     fn a_fresh_log_holds_nothing_at_offset_zero() {
