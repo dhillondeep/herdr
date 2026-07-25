@@ -21,6 +21,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
+        "wait-any" => agent_wait_any(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
         "explain" => agent_explain(&args[1..]),
@@ -801,6 +802,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");
+    println!("  herdr agent wait-any --status <status>... [--host H] [--count N] [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!(
         "  herdr agent start <name> --kind KIND --pane ID [--timeout MS] [-- <agent-args...>]"
@@ -818,4 +820,137 @@ fn parse_timeout(value: &str) -> Result<u64, i32> {
         eprintln!("{err}");
         2
     })
+}
+
+/// Block until ANY agent reaches one of the given statuses.
+///
+/// `agent wait` resolves one target and follows it. With several machines the
+/// useful question is the other way round — "tell me when anything, anywhere,
+/// needs a decision" — and that was not expressible before.
+///
+/// Deliberately client-side over the existing `agent.list`, rather than a new
+/// protocol method. It needs no schema change, no protocol version bump, and no
+/// server state; the cost is polling, which is fine for a command whose whole job
+/// is to block.
+fn agent_wait_any(args: &[String]) -> std::io::Result<i32> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+    let mut statuses: Vec<String> = Vec::new();
+    let mut host: Option<String> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut want_count: usize = 1;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--status" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --status");
+                    return Ok(2);
+                };
+                statuses.push(value.to_ascii_lowercase());
+                index += 2;
+            }
+            "--host" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --host");
+                    return Ok(2);
+                };
+                host = Some(value.clone());
+                index += 2;
+            }
+            "--count" => {
+                let Some(value) = args.get(index + 1).and_then(|v| v.parse::<usize>().ok()) else {
+                    eprintln!("--count needs a positive number");
+                    return Ok(2);
+                };
+                if value == 0 {
+                    eprintln!("--count needs a positive number");
+                    return Ok(2);
+                }
+                want_count = value;
+                index += 2;
+            }
+            "--timeout" => {
+                let Some(value) = args.get(index + 1).and_then(|v| v.parse::<u64>().ok()) else {
+                    eprintln!("--timeout needs a number of milliseconds");
+                    return Ok(2);
+                };
+                timeout_ms = Some(value);
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                eprintln!("usage: herdr agent wait-any --status <status>... [--host H] [--count N] [--timeout MS]");
+                return Ok(2);
+            }
+        }
+    }
+
+    if statuses.is_empty() {
+        eprintln!("usage: herdr agent wait-any --status <status>... [--host H] [--count N] [--timeout MS]");
+        return Ok(2);
+    }
+    for status in &statuses {
+        if !matches!(
+            status.as_str(),
+            "idle" | "working" | "blocked" | "done" | "unknown"
+        ) {
+            eprintln!("unknown agent status `{status}`");
+            return Ok(2);
+        }
+    }
+
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+
+    loop {
+        let response = super::send_request(&Request {
+            id: "cli:agent:wait-any".into(),
+            method: Method::AgentList(EmptyParams::default()),
+        })?;
+
+        let matched: Vec<&serde_json::Value> = response["result"]["agents"]
+            .as_array()
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter(|agent| {
+                        let status_matches = agent["agent_status"]
+                            .as_str()
+                            .is_some_and(|status| statuses.iter().any(|want| want == status));
+                        // An absent host means the local machine, so `--host`
+                        // filters to one machine rather than merely preferring it.
+                        let host_matches = host.as_ref().is_none_or(|want| {
+                            agent["host"].as_str().is_some_and(|have| have == want)
+                        });
+                        status_matches && host_matches
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if matched.len() >= want_count {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "id": "cli:agent:wait-any",
+                    "result": { "type": "agent_list", "agents": matched },
+                }))?
+            );
+            return Ok(0);
+        }
+
+        // Checked after the poll, so a wait that is already satisfied succeeds even
+        // with a zero timeout.
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            eprintln!(
+                "timed out waiting for {want_count} agent(s) with status {}",
+                statuses.join(" or ")
+            );
+            return Ok(1);
+        }
+
+        std::thread::sleep(POLL);
+    }
 }
