@@ -16,6 +16,10 @@ pub mod protocol;
 /// than pretending to support it.
 /// Local end of a host connection. Unix-only for the same reason as the daemon:
 /// it hands a socket fd to the PTY actor.
+/// Installing a binary on a host. Unix-only like the rest of the host path.
+#[cfg(unix)]
+pub mod install;
+
 #[cfg(unix)]
 pub mod link;
 

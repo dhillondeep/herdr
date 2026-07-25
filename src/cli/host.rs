@@ -10,6 +10,13 @@ pub(super) fn run_host_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("list") => host_list(&args[1..]),
         #[cfg(unix)]
+        Some("install") => host_install(&args[1..]),
+        #[cfg(windows)]
+        Some("install") => {
+            eprintln!("herdr host install is not supported on Windows yet");
+            Ok(2)
+        }
+        #[cfg(unix)]
         Some("probe") => host_probe(&args[1..]),
         #[cfg(windows)]
         Some("probe") => {
@@ -120,6 +127,7 @@ fn print_host_help() {
     println!("herdr host commands:");
     println!("  herdr host list [--json]");
     println!("  herdr host probe <host>");
+    println!("  herdr host install <host> --from <binary>");
     println!();
     println!("DIALABLE means ssh knows how to reach the name — a literal Host stanza, or a");
     println!("discovered name that ssh -G resolves. It does not mean the machine is up.");
@@ -203,5 +211,68 @@ fn host_probe(args: &[String]) -> std::io::Result<i32> {
     } else {
         eprintln!("connected to {host} but never saw the probe output");
         Ok(1)
+    }
+}
+
+/// Copy a herdr binary to a host.
+///
+/// A host needs a binary built for its own os/arch, and no release contains
+/// `pty-host` yet, so this takes one you built and puts it where a connection will
+/// look for it. Doing that by hand for every machine is the main friction in using
+/// remote workspaces.
+#[cfg(unix)]
+fn host_install(args: &[String]) -> std::io::Result<i32> {
+    let Some(name) = args.first() else {
+        eprintln!("usage: herdr host install <host> --from <binary>");
+        return Ok(2);
+    };
+    let Some(host) = crate::host::HostId::parse(name) else {
+        eprintln!("invalid host name `{name}`");
+        return Ok(2);
+    };
+
+    let mut source: Option<std::path::PathBuf> = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--from" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --from");
+                    return Ok(2);
+                };
+                source = Some(std::path::PathBuf::from(value));
+                index += 2;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+
+    let Some(source) = source else {
+        eprintln!("usage: herdr host install <host> --from <binary>");
+        eprintln!("the binary must be built for the host's os/arch, not this machine's");
+        return Ok(2);
+    };
+
+    match crate::host::install::install_binary(host.as_str(), &source) {
+        Ok(installed) => {
+            println!(
+                "installed {} bytes to {}:{}",
+                installed.bytes, host, installed.destination
+            );
+            match installed.verified_sha256 {
+                Some(sum) => println!("verified sha256 {sum}"),
+                // Worth saying: silence here would read as a successful check.
+                None => println!("host has no sha256 tool; contents were not verified"),
+            }
+            println!("run `herdr host probe {host}` to confirm it works");
+            Ok(0)
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            Ok(1)
+        }
     }
 }
