@@ -756,6 +756,139 @@ impl WorktreeOpenState {
     }
 }
 
+// The picker's state and selection semantics land before the mode, key handler
+// and renderer that drive them. Deliberately split: this half is pure and fully
+// tested, while the UI half additionally needs discovery moved off the UI thread
+// (a discovery command can take seconds, and the list must render instantly).
+/// One row in the host picker: the local machine, or a discovered/configured host.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPickEntry {
+    /// `None` is the local machine, which is always offered first.
+    pub host: Option<crate::host::HostId>,
+    /// How this host was found, for display. Empty for the local row.
+    pub origin: String,
+}
+
+#[allow(dead_code)]
+impl HostPickEntry {
+    pub fn local() -> Self {
+        Self {
+            host: None,
+            origin: String::new(),
+        }
+    }
+
+    /// Text shown and searched. The local row is matched by "local" so it can be
+    /// filtered to like anything else.
+    pub fn search_text(&self) -> String {
+        match &self.host {
+            None => "local".to_string(),
+            Some(host) => format!("{host} {}", self.origin),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match &self.host {
+            None => "local".to_string(),
+            Some(host) => host.to_string(),
+        }
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        text_matches_query(query, &self.search_text())
+    }
+}
+
+/// Picker shown when creating a workspace, so local-vs-remote is a choice rather
+/// than a config file edit.
+///
+/// Mirrors `WorktreeOpenState`: same filter/selection semantics, so the two
+/// pickers behave identically for the user.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPickState {
+    pub entries: Vec<HostPickEntry>,
+    pub selected: usize,
+    pub query: String,
+    pub search_focused: bool,
+    /// Set when discovery produced nothing beyond the local machine, so the
+    /// picker can explain itself rather than looking broken.
+    pub note: Option<String>,
+}
+
+#[allow(dead_code)]
+impl HostPickState {
+    /// Local first, then hosts in the order discovery returned them.
+    pub fn new(hosts: Vec<HostPickEntry>) -> Self {
+        let mut entries = vec![HostPickEntry::local()];
+        entries.extend(hosts);
+        let note = (entries.len() == 1)
+            .then(|| "no remote hosts found — add a Host entry to your ssh config".to_string());
+        Self {
+            entries,
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            note,
+        }
+    }
+
+    pub(crate) fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.query.trim();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                (query.is_empty() || entry.matches_query(query)).then_some(idx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_entry_index(&self) -> Option<usize> {
+        let indices = self.filtered_indices();
+        if indices.contains(&self.selected) {
+            Some(self.selected)
+        } else {
+            indices.first().copied()
+        }
+    }
+
+    /// The chosen host, or `None` for the local machine.
+    ///
+    /// Returns `None` when the filter excludes everything, which the caller must
+    /// treat as "no choice made" rather than "local" — otherwise an empty filter
+    /// result would silently create a local workspace.
+    pub(crate) fn chosen(&self) -> Option<&HostPickEntry> {
+        self.selected_entry_index()
+            .and_then(|idx| self.entries.get(idx))
+    }
+
+    pub(crate) fn normalize_selection(&mut self) {
+        if let Some(selected) = self.selected_entry_index() {
+            self.selected = selected;
+        }
+    }
+
+    pub(crate) fn select_previous_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(1)];
+    }
+
+    pub(crate) fn select_next_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[(pos + 1).min(indices.len().saturating_sub(1))];
+    }
+}
+
 pub(crate) fn text_matches_query(query: &str, text: &str) -> bool {
     let haystack = text.to_lowercase();
     query
@@ -2523,6 +2656,157 @@ mod tests {
                 "Open worktree...",
                 "Collapse"
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod host_pick_tests {
+    use super::*;
+
+    fn remote(name: &str, origin: &str) -> HostPickEntry {
+        HostPickEntry {
+            host: crate::host::HostId::parse(name),
+            origin: origin.to_string(),
+        }
+    }
+
+    fn pick() -> HostPickState {
+        HostPickState::new(vec![
+            remote("coder.box1", "discovered"),
+            remote("build.example.com", "ssh-config"),
+        ])
+    }
+
+    #[test]
+    fn local_is_always_offered_first_and_selected_by_default() {
+        let state = pick();
+        assert_eq!(state.entries[0].host, None);
+        assert_eq!(state.entries[0].label(), "local");
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("local".into())
+        );
+    }
+
+    #[test]
+    fn a_picker_with_no_remote_hosts_explains_itself() {
+        let empty = HostPickState::new(Vec::new());
+        assert_eq!(empty.entries.len(), 1, "local is still offered");
+        assert!(
+            empty.note.is_some(),
+            "an otherwise empty picker must say why rather than look broken"
+        );
+        assert!(pick().note.is_none(), "no note when hosts exist");
+    }
+
+    #[test]
+    fn filtering_narrows_to_matching_hosts() {
+        let mut state = pick();
+        state.query = "box1".to_string();
+        state.normalize_selection();
+
+        assert_eq!(state.filtered_indices().len(), 1);
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("coder.box1".into())
+        );
+    }
+
+    #[test]
+    fn the_local_row_is_reachable_by_filtering_for_local() {
+        let mut state = pick();
+        state.query = "local".to_string();
+        state.normalize_selection();
+
+        assert_eq!(state.filtered_indices(), vec![0]);
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("local".into())
+        );
+    }
+
+    #[test]
+    fn origin_is_searchable_so_you_can_filter_to_discovered_hosts() {
+        let mut state = pick();
+        state.query = "discovered".to_string();
+        state.normalize_selection();
+
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("coder.box1".into())
+        );
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_chooses_nothing_rather_than_local() {
+        // The trap: falling back to entry 0 here would silently create a LOCAL
+        // workspace when the user typed a host name that does not exist.
+        let mut state = pick();
+        state.query = "no-such-host".to_string();
+
+        assert!(state.filtered_indices().is_empty());
+        assert!(
+            state.chosen().is_none(),
+            "an empty filter result must not resolve to the local machine"
+        );
+    }
+
+    #[test]
+    fn selection_moves_within_the_filtered_set_and_stops_at_the_ends() {
+        let mut state = pick();
+        assert_eq!(state.selected, 0);
+
+        state.select_next_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("coder.box1".into())
+        );
+        state.select_next_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("build.example.com".into())
+        );
+        // Already at the end.
+        state.select_next_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("build.example.com".into())
+        );
+
+        state.select_previous_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("coder.box1".into())
+        );
+        state.select_previous_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("local".into())
+        );
+        state.select_previous_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("local".into())
+        );
+    }
+
+    #[test]
+    fn selection_follows_the_filter_when_the_current_row_is_excluded() {
+        let mut state = pick();
+        state.select_next_filtered();
+        state.select_next_filtered();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("build.example.com".into())
+        );
+
+        state.query = "box1".to_string();
+        state.normalize_selection();
+        assert_eq!(
+            state.chosen().map(HostPickEntry::label),
+            Some("coder.box1".into()),
+            "selection must move to a row that is actually visible"
         );
     }
 }
