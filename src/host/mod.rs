@@ -14,6 +14,11 @@ pub mod protocol;
 /// The pty-host daemon owns real PTYs, and herdr's whole pty/remote/handoff path
 /// is Unix-only today. Mirrors how `crate::remote` stubs out on Windows rather
 /// than pretending to support it.
+/// Local end of a host connection. Unix-only for the same reason as the daemon:
+/// it hands a socket fd to the PTY actor.
+#[cfg(unix)]
+pub mod link;
+
 #[cfg(unix)]
 pub mod pty_host;
 
