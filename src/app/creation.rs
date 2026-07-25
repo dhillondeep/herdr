@@ -111,6 +111,7 @@ impl App {
             request_id,
             crate::api::schema::WorkspaceCreateParams {
                 cwd: None,
+                host: None,
                 focus: true,
                 label: None,
                 env: Default::default(),

@@ -39,6 +39,7 @@ fn workspace_list(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn workspace_create(args: &[String]) -> std::io::Result<i32> {
+    let mut host: Option<String> = None;
     let mut cwd = None;
     let mut focus = false;
     let mut label = None;
@@ -61,6 +62,14 @@ fn workspace_create(args: &[String]) -> std::io::Result<i32> {
                     return Ok(2);
                 };
                 label = Some(value.clone());
+                index += 2;
+            }
+            "--host" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --host");
+                    return Ok(2);
+                };
+                host = Some(value.clone());
                 index += 2;
             }
             "--focus" => {
@@ -95,6 +104,7 @@ fn workspace_create(args: &[String]) -> std::io::Result<i32> {
 
     super::runtime::workspace_create(WorkspaceCreateParams {
         cwd,
+        host,
         focus,
         label,
         env,

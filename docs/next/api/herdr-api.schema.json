@@ -4097,6 +4097,13 @@
               "default": false,
               "type": "boolean"
             },
+            "host": {
+              "description": "Machine to run this workspace's processes on. Absent means local.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "label": {
               "type": [
                 "string",

@@ -51,8 +51,25 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        // Parse before creating anything: a rejected host must not leave a
+        // half-configured workspace behind, and an unparseable name must never
+        // be stored where it could later reach an ssh command line.
+        let host = match params.host.as_deref() {
+            None => None,
+            Some(name) => match crate::host::HostId::parse(name) {
+                Some(host) => Some(host),
+                None => {
+                    return encode_error(id, "invalid_host", format!("invalid host name `{name}`"))
+                }
+            },
+        };
         match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
             Ok(index) => {
+                if let Some(host) = host {
+                    if let Some(workspace) = self.state.workspaces.get_mut(index) {
+                        workspace.host = Some(host);
+                    }
+                }
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
                         workspace.set_custom_name(label);
@@ -285,6 +302,102 @@ mod tests {
     // `new_cwd = follow` must anchor on the focused pane for every creation
     // surface. Splits and tabs already do; a new workspace must follow the
     // focused pane too, not the source workspace's first-tab root pane.
+    /// An App whose panes run a command that exits immediately, so creating a
+    /// workspace in a test does not leave a real shell behind.
+    fn host_test_app() -> App {
+        use super::super::test_support::exiting_test_command;
+        use crate::config::ShellModeConfig;
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.default_shell = exiting_test_command().into();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        app.state.workspaces = vec![Workspace::test_new("spaces")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app
+    }
+
+    #[tokio::test]
+    async fn workspace_create_binds_the_requested_host() {
+        let mut app = host_test_app();
+
+        let response = app.handle_workspace_create(
+            "req".into(),
+            WorkspaceCreateParams {
+                host: Some("coder.box1".to_string()),
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert!(matches!(
+            success.result,
+            ResponseResult::WorkspaceCreated { .. }
+        ));
+        let created = app.state.workspaces.last().unwrap();
+        assert_eq!(
+            created.host.as_ref().map(|host| host.as_str()),
+            Some("coder.box1")
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_create_defaults_to_local() {
+        let mut app = host_test_app();
+        let before = app.state.workspaces.len();
+
+        app.handle_workspace_create(
+            "req".into(),
+            WorkspaceCreateParams {
+                host: None,
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        assert_eq!(app.state.workspaces.len(), before + 1);
+        assert_eq!(app.state.workspaces.last().unwrap().host, None);
+    }
+
+    #[tokio::test]
+    async fn workspace_create_rejects_an_unsafe_host_without_creating_anything() {
+        // The name would reach an ssh command line, so it must be refused — and
+        // refused before any workspace exists, so no half-configured workspace
+        // is left behind.
+        let mut app = host_test_app();
+        let before = app.state.workspaces.len();
+
+        let response = app.handle_workspace_create(
+            "req".into(),
+            WorkspaceCreateParams {
+                host: Some("box1; rm -rf /".to_string()),
+                cwd: None,
+                focus: false,
+                label: None,
+                env: Default::default(),
+            },
+        );
+
+        assert!(response.contains("invalid_host"), "{response}");
+        assert_eq!(
+            app.state.workspaces.len(),
+            before,
+            "a rejected host must not create a workspace"
+        );
+    }
+
     #[tokio::test]
     async fn workspace_create_follows_focused_pane_cwd_not_first_tab_root() {
         use super::super::test_support::{exiting_test_command, shutdown_test_runtimes};
@@ -339,6 +452,7 @@ mod tests {
         let response = app.handle_workspace_create(
             "req".into(),
             WorkspaceCreateParams {
+                host: None,
                 cwd: None,
                 focus: false,
                 label: None,

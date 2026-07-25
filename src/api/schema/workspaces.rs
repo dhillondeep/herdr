@@ -8,6 +8,9 @@ use super::common::AgentStatus;
 pub struct WorkspaceCreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Machine to run this workspace's processes on. Absent means local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     #[serde(default)]
     pub focus: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
