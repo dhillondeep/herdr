@@ -1028,6 +1028,23 @@ pub struct PaneRuntime {
 
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
+    // Constructed by the remote spawn path, which lands next: it needs a small
+    // refactor of from_handoff_fd, the existing constructor that builds a runtime
+    // with no local child, so both paths share one body rather than duplicating
+    // terminal and detection setup.
+    #[allow(dead_code)]
+    /// A pane whose process runs on another machine.
+    ///
+    /// Byte I/O still goes through the ordinary actor: its fd is one end of a
+    /// socket pair the link pumps to the host, so reads and writes need no
+    /// special case. Only window size diverges, because that is an ioctl on a
+    /// real PTY master and this fd is a socket.
+    #[cfg(unix)]
+    Remote {
+        actor: PtyIoActorHandle,
+        link: std::sync::Arc<crate::host::link::HostLink>,
+        channel: crate::host::protocol::ChannelId,
+    },
     #[cfg(test)]
     TestChannel {
         sender: mpsc::Sender<Bytes>,
@@ -1039,6 +1056,18 @@ impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
+            #[cfg(unix)]
+            PaneRuntimeIo::Remote {
+                actor,
+                link,
+                channel,
+            } => {
+                // Ask the host to end the process session first: it owns the
+                // pids. Closing our side alone would leave the remote process
+                // running with nobody reading it.
+                let _ = link.shutdown_channel(*channel);
+                actor.shutdown();
+            }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
         }
@@ -1048,6 +1077,12 @@ impl PaneRuntimeIo {
     fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.duplicate_for_handoff(),
+            // Live handoff passes a PTY master fd between local server
+            // processes over SCM_RIGHTS. A remote pane has no such fd to give:
+            // it resumes instead of travelling.
+            PaneRuntimeIo::Remote { .. } => Err(std::io::Error::other(
+                "a remote pane cannot take part in live handoff",
+            )),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
@@ -1059,6 +1094,9 @@ impl PaneRuntimeIo {
     fn foreground_process_group_id(&self) -> Option<u32> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id(),
+            // tcgetpgrp on a socket is meaningless, and a remote pgid would be a
+            // number from another machine's pid namespace.
+            PaneRuntimeIo::Remote { .. } => None,
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => None,
         }
@@ -1068,6 +1106,9 @@ impl PaneRuntimeIo {
     fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Remote { .. } => Err(std::io::Error::other(
+                "a remote pane cannot take part in live handoff",
+            )),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1083,6 +1124,8 @@ impl PaneRuntimeIo {
                     actor.rollback_handoff()
                 }
             }
+            // Pausing readers is part of handoff, which remote panes skip.
+            PaneRuntimeIo::Remote { .. } => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1092,6 +1135,7 @@ impl PaneRuntimeIo {
     fn release_after_commit(&self) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.release_after_commit(),
+            PaneRuntimeIo::Remote { .. } => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1115,6 +1159,22 @@ impl PaneRuntimeIo {
                     terminal_responses,
                 );
             }
+            #[cfg(unix)]
+            PaneRuntimeIo::Remote {
+                actor,
+                link,
+                channel,
+            } => {
+                // Deliberately NOT actor.resize(): that ioctls the fd, which is a
+                // socket here, so it would fail with ENOTTY and be swallowed at
+                // debug! — a pane that silently never resizes. The host applies
+                // the real ioctl on the real master.
+                let _ = link.resize(*channel, rows, cols, cell_width_px, cell_height_px);
+                // Terminal replies still belong in the input stream, in order.
+                for response in terminal_responses {
+                    let _ = actor.try_write_user_input(response);
+                }
+            }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { resize_tx, .. } => {
                 let _ = resize_tx.send((rows, cols, cell_width_px, cell_height_px));
@@ -1134,6 +1194,9 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => {
                 actor.nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
             }
+            // The nudge exists to make a child repaint after a handoff, which
+            // remote panes do not do.
+            PaneRuntimeIo::Remote { .. } => {}
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
         }
@@ -1142,6 +1205,8 @@ impl PaneRuntimeIo {
     async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_user_input(bytes).await,
+            #[cfg(unix)]
+            PaneRuntimeIo::Remote { actor, .. } => actor.write_user_input(bytes).await,
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.send(bytes).await,
         }
@@ -1150,6 +1215,8 @@ impl PaneRuntimeIo {
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            #[cfg(unix)]
+            PaneRuntimeIo::Remote { actor, .. } => actor.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
