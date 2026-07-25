@@ -67,8 +67,12 @@ impl App {
             Ok(index) => {
                 if let Some(host) = host {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
-                        workspace.host = Some(host);
+                        workspace.host = Some(host.clone());
                     }
+                    // Start connecting now rather than when the first pane needs
+                    // it, so nobody waits on an ssh handshake mid-interaction.
+                    #[cfg(unix)]
+                    crate::app::warm_host_connection(&self.host_links, host);
                 }
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {

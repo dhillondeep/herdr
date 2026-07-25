@@ -102,11 +102,70 @@ pub(crate) struct HostConnection {
     _ssh: std::process::Child,
 }
 
+/// Connections, shared so a background thread can complete one without going
+/// through the event loop.
+///
+/// Deliberately not an AppEvent: routing a live connection through the event
+/// system would mean making the link `Debug` and threading it through state that
+/// has no other reason to know about it.
+#[cfg(unix)]
+#[derive(Default)]
+pub(crate) struct HostRegistryInner {
+    live: std::collections::HashMap<crate::host::HostId, HostConnection>,
+    /// Hosts with a connect already in flight, so warming twice does not open two
+    /// ssh connections to the same machine.
+    connecting: std::collections::HashSet<crate::host::HostId>,
+}
+
+#[cfg(unix)]
+pub(crate) type HostRegistry = std::sync::Arc<std::sync::Mutex<HostRegistryInner>>;
+
+/// Open a connection to `host` on a background thread.
+///
+/// Called when a workspace is bound to a host, so the connection is usually ready
+/// by the time a pane needs it and nobody waits on the ssh handshake. A failure is
+/// logged and forgotten: the synchronous path will try again and report properly if
+/// a pane actually needs it.
+#[cfg(unix)]
+pub(crate) fn warm_host_connection(registry: &HostRegistry, host: crate::host::HostId) {
+    {
+        let Ok(mut guard) = registry.lock() else {
+            return;
+        };
+        if guard.live.contains_key(&host) || !guard.connecting.insert(host.clone()) {
+            return;
+        }
+    }
+
+    let registry = std::sync::Arc::clone(registry);
+    std::thread::spawn(move || {
+        let connected = crate::host::link::HostLink::connect_over_ssh(host.as_str());
+        let Ok(mut guard) = registry.lock() else {
+            return;
+        };
+        guard.connecting.remove(&host);
+        match connected {
+            Ok((link, ssh)) => {
+                guard.live.insert(
+                    host,
+                    HostConnection {
+                        link: std::sync::Arc::new(link),
+                        _ssh: ssh,
+                    },
+                );
+            }
+            Err(err) => {
+                tracing::warn!(host = %host, err = %err, "background connect to host failed");
+            }
+        }
+    });
+}
+
 pub struct App {
     pub state: AppState,
-    /// Connections opened on demand, one per host, shared by all its panes.
+    /// Connections, one per host, shared by all its panes.
     #[cfg(unix)]
-    pub(crate) host_links: std::collections::HashMap<crate::host::HostId, HostConnection>,
+    pub(crate) host_links: HostRegistry,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
@@ -254,20 +313,30 @@ impl App {
         &mut self,
         host: &crate::host::HostId,
     ) -> Option<std::sync::Arc<crate::host::link::HostLink>> {
-        if let Some(existing) = self.host_links.get(host) {
-            return Some(std::sync::Arc::clone(&existing.link));
+        // Usually already warm: binding a workspace to a host starts a background
+        // connect, so this hits the cache and nothing waits on ssh.
+        if let Some(existing) = self
+            .host_links
+            .lock()
+            .ok()
+            .and_then(|guard| guard.live.get(host).map(|c| std::sync::Arc::clone(&c.link)))
+        {
+            return Some(existing);
         }
 
         match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
             Ok((link, ssh)) => {
                 let link = std::sync::Arc::new(link);
-                self.host_links.insert(
-                    host.clone(),
-                    HostConnection {
-                        link: std::sync::Arc::clone(&link),
-                        _ssh: ssh,
-                    },
-                );
+                if let Ok(mut guard) = self.host_links.lock() {
+                    guard.connecting.remove(host);
+                    guard.live.insert(
+                        host.clone(),
+                        HostConnection {
+                            link: std::sync::Arc::clone(&link),
+                            _ssh: ssh,
+                        },
+                    );
+                }
                 Some(link)
             }
             Err(err) => {
@@ -805,7 +874,7 @@ impl App {
             last_api_notification_at: None,
             state,
             #[cfg(unix)]
-            host_links: std::collections::HashMap::new(),
+            host_links: HostRegistry::default(),
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
