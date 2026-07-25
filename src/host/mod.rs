@@ -5,6 +5,26 @@
 //! Public ids (`w1`, `w1:p1`, `w1:t1`) are unchanged by a host binding.
 
 pub mod discovery;
+// Stays cross-platform: a Windows local side talking to a Unix host is a
+// plausible future, so the protocol is not Unix-gated. Nothing consumes it on
+// Windows yet, hence the platform-scoped allow rather than a blanket one.
+#[cfg_attr(windows, allow(dead_code))]
+pub mod protocol;
+
+/// The pty-host daemon owns real PTYs, and herdr's whole pty/remote/handoff path
+/// is Unix-only today. Mirrors how `crate::remote` stubs out on Windows rather
+/// than pretending to support it.
+#[cfg(unix)]
+pub mod pty_host;
+
+#[cfg(windows)]
+pub mod pty_host {
+    pub fn run() -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "herdr pty-host is not supported on Windows yet",
+        ))
+    }
+}
 pub mod sources;
 
 use std::fmt;

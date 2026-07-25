@@ -496,6 +496,11 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge();
     }
 
+    // Hidden: runs on a remote machine and owns its PTYs. Not user-facing.
+    if args.get(1).map(|s| s.as_str()) == Some("pty-host") {
+        return host::pty_host::run();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
     }
@@ -679,6 +684,7 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "pty-host",
                 "update",
                 "status",
                 "config",

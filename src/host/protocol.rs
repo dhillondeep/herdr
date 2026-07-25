@@ -1,0 +1,376 @@
+//! Wire protocol between the local herdr server and a `herdr pty-host` daemon.
+//!
+//! The local side owns everything that interprets bytes — the VT parser, the
+//! grid, scrollback, detection, layout. The daemon owns only the PTYs. So this
+//! protocol is deliberately small: spawn a process, move bytes, resize, report
+//! exit. Anything richer belongs on the local side.
+//!
+//! Framing is reused from [`crate::protocol::wire`] so there is one length-prefix
+//! implementation in the codebase, but the message set and version are separate:
+//! the client/server protocol and the host protocol evolve independently, and a
+//! host is provisioned separately from the binary talking to it.
+
+use serde::{Deserialize, Serialize};
+
+pub use crate::protocol::wire::FramingError;
+
+/// Version of this host protocol.
+///
+/// Deliberately independent of `wire::PROTOCOL_VERSION`. Hosts are provisioned
+/// per machine and may lag, so compatibility is a *range* rather than equality —
+/// see [`negotiate`]. Exact-match versioning here would mean one stale host
+/// bricks that host until re-provisioned.
+pub const HOST_PROTOCOL_VERSION: u32 = 1;
+
+/// Oldest host protocol this build can still talk to.
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 1;
+
+/// Cap on a single host frame. Output is chunked well below this; the cap exists
+/// so a corrupted length prefix cannot make us allocate wildly.
+pub const MAX_HOST_FRAME_SIZE: usize = 1024 * 1024;
+
+/// Identifies one PTY within a host link. Assigned by the local side so it can
+/// route replies without waiting for an acknowledgement.
+pub type ChannelId = u64;
+
+/// What to run on the remote machine.
+///
+/// The shell is resolved *by the daemon*, not here: the local machine's `$SHELL`,
+/// its passwd entry and its filesystem are all irrelevant to a process that will
+/// run somewhere else. Sending a resolved command would bake in local answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnSpec {
+    /// Explicit argv. Empty means "the remote user's login shell".
+    pub argv: Vec<String>,
+    /// Working directory on the remote machine. Absent means the remote default.
+    pub cwd: Option<String>,
+    /// Environment entries to set. Only what herdr needs — the local process
+    /// environment is deliberately not shipped.
+    pub env: Vec<(String, String)>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// Local server to daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToHost {
+    /// First frame on a link. Carries the local side's protocol version.
+    Hello {
+        version: u32,
+    },
+    Spawn {
+        channel: ChannelId,
+        spec: SpawnSpec,
+    },
+    /// Bytes typed by the user, destined for the PTY.
+    Data {
+        channel: ChannelId,
+        bytes: Vec<u8>,
+    },
+    /// Window size change. This is a message rather than an ioctl because the
+    /// PTY is on the other side of the link.
+    Resize {
+        channel: ChannelId,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    },
+    /// Terminate the channel's process session, escalating as needed. Performed
+    /// by the daemon, which is where the pids actually live.
+    Shutdown {
+        channel: ChannelId,
+    },
+}
+
+/// Daemon to local server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FromHost {
+    /// Response to `Hello`, carrying the daemon's version so either side can
+    /// refuse a pairing it cannot support.
+    Welcome { version: u32 },
+    /// A spawn succeeded. `pid` is the process id **on the host**, useful only
+    /// for display and for the daemon's own bookkeeping — never for a local
+    /// signal or a local `/proc` read.
+    Spawned { channel: ChannelId, pid: u32 },
+    /// A spawn failed. The channel is dead; no `Exited` will follow.
+    SpawnFailed { channel: ChannelId, message: String },
+    /// PTY output.
+    Data { channel: ChannelId, bytes: Vec<u8> },
+    /// The channel's process finished. `status` is the raw wait status if known.
+    Exited {
+        channel: ChannelId,
+        status: Option<i32>,
+    },
+}
+
+/// Outcome of comparing two protocol versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Negotiation {
+    Ok,
+    /// The peer is too old for this build to talk to.
+    PeerTooOld {
+        peer: u32,
+        min_supported: u32,
+    },
+    /// The peer speaks a newer protocol than this build understands.
+    PeerTooNew {
+        peer: u32,
+        ours: u32,
+    },
+}
+
+/// Decide whether we can talk to a peer advertising `peer_version`.
+///
+/// Accepts a range rather than requiring equality, so a host provisioned by an
+/// older herdr keeps working until it is convenient to re-provision it. Failure
+/// names both versions, because "incompatible" without numbers is the least
+/// actionable possible message when N hosts are involved.
+pub fn negotiate(peer_version: u32) -> Negotiation {
+    if peer_version < MIN_SUPPORTED_HOST_PROTOCOL_VERSION {
+        Negotiation::PeerTooOld {
+            peer: peer_version,
+            min_supported: MIN_SUPPORTED_HOST_PROTOCOL_VERSION,
+        }
+    } else if peer_version > HOST_PROTOCOL_VERSION {
+        Negotiation::PeerTooNew {
+            peer: peer_version,
+            ours: HOST_PROTOCOL_VERSION,
+        }
+    } else {
+        Negotiation::Ok
+    }
+}
+
+/// Whether a framing error is worth retrying.
+///
+/// A truncated or failed read is a transport problem and a redial may fix it. A
+/// decode failure or an oversized frame means the two sides disagree about the
+/// bytes on the wire; retrying that forever would spin. Distinguishing them is
+/// what keeps reconnect from becoming an infinite loop.
+// Used by the reconnecting link, which lands next; kept here because it is the
+// classification the protocol defines, and it is covered by tests.
+#[allow(dead_code)]
+pub fn framing_error_is_retryable(error: &FramingError) -> bool {
+    match error {
+        FramingError::Io(_) | FramingError::UnexpectedEof => true,
+        FramingError::Bincode(_) | FramingError::Oversized { .. } => false,
+    }
+}
+
+pub fn write_frame<W: std::io::Write, M: Serialize>(
+    writer: &mut W,
+    message: &M,
+) -> Result<(), FramingError> {
+    crate::protocol::wire::write_message(writer, message)
+}
+
+pub fn read_frame<R: std::io::Read, M: for<'de> Deserialize<'de>>(
+    reader: &mut R,
+) -> Result<M, FramingError> {
+    crate::protocol::wire::read_message(reader, MAX_HOST_FRAME_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> SpawnSpec {
+        SpawnSpec {
+            argv: vec!["bash".into(), "-lc".into(), "echo hi".into()],
+            cwd: Some("/work".into()),
+            env: vec![("HERDR_ENV".into(), "1".into())],
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    #[test]
+    fn to_host_messages_round_trip() {
+        let messages = vec![
+            ToHost::Hello {
+                version: HOST_PROTOCOL_VERSION,
+            },
+            ToHost::Spawn {
+                channel: 7,
+                spec: spec(),
+            },
+            ToHost::Data {
+                channel: 7,
+                bytes: b"ls -la\n".to_vec(),
+            },
+            ToHost::Resize {
+                channel: 7,
+                rows: 40,
+                cols: 120,
+                cell_width_px: 8,
+                cell_height_px: 16,
+            },
+            ToHost::Shutdown { channel: 7 },
+        ];
+
+        for message in messages {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &message).unwrap();
+            let decoded: ToHost = read_frame(&mut buffer.as_slice()).unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn from_host_messages_round_trip() {
+        let messages = vec![
+            FromHost::Welcome {
+                version: HOST_PROTOCOL_VERSION,
+            },
+            FromHost::Spawned {
+                channel: 1,
+                pid: 4242,
+            },
+            FromHost::SpawnFailed {
+                channel: 1,
+                message: "no such directory".into(),
+            },
+            FromHost::Data {
+                channel: 1,
+                bytes: vec![0x1b, b'[', b'2', b'J'],
+            },
+            FromHost::Exited {
+                channel: 1,
+                status: Some(0),
+            },
+            FromHost::Exited {
+                channel: 1,
+                status: None,
+            },
+        ];
+
+        for message in messages {
+            let mut buffer = Vec::new();
+            write_frame(&mut buffer, &message).unwrap();
+            let decoded: FromHost = read_frame(&mut buffer.as_slice()).unwrap();
+            assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn several_frames_share_one_stream_without_bleeding() {
+        // Byte streams are what this protocol is for, so back-to-back frames
+        // must decode independently rather than as one blob.
+        let mut buffer = Vec::new();
+        for chunk in [&b"one"[..], &b"two"[..], &b"three"[..]] {
+            write_frame(
+                &mut buffer,
+                &FromHost::Data {
+                    channel: 3,
+                    bytes: chunk.to_vec(),
+                },
+            )
+            .unwrap();
+        }
+
+        let mut reader = buffer.as_slice();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let FromHost::Data { bytes, .. } = read_frame::<_, FromHost>(&mut reader).unwrap()
+            else {
+                panic!("expected data frames");
+            };
+            seen.push(bytes);
+        }
+        assert_eq!(
+            seen,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+    }
+
+    #[test]
+    fn binary_output_survives_intact() {
+        // PTY output is arbitrary bytes: escape sequences, invalid UTF-8, NULs.
+        // Anything that assumes text here would corrupt a real terminal stream.
+        let bytes: Vec<u8> = (0u8..=255).chain([0x1b, 0x00, 0xff]).collect();
+        let message = FromHost::Data {
+            channel: 9,
+            bytes: bytes.clone(),
+        };
+
+        let mut buffer = Vec::new();
+        write_frame(&mut buffer, &message).unwrap();
+        let decoded: FromHost = read_frame(&mut buffer.as_slice()).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn version_negotiation_accepts_a_range_not_just_equality() {
+        assert_eq!(negotiate(HOST_PROTOCOL_VERSION), Negotiation::Ok);
+        assert_eq!(
+            negotiate(MIN_SUPPORTED_HOST_PROTOCOL_VERSION),
+            Negotiation::Ok
+        );
+    }
+
+    #[test]
+    fn version_negotiation_names_both_sides_when_it_fails() {
+        // With many hosts, "incompatible" without numbers is unactionable.
+        assert_eq!(
+            negotiate(HOST_PROTOCOL_VERSION + 5),
+            Negotiation::PeerTooNew {
+                peer: HOST_PROTOCOL_VERSION + 5,
+                ours: HOST_PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            negotiate(MIN_SUPPORTED_HOST_PROTOCOL_VERSION - 1),
+            Negotiation::PeerTooOld {
+                peer: MIN_SUPPORTED_HOST_PROTOCOL_VERSION - 1,
+                min_supported: MIN_SUPPORTED_HOST_PROTOCOL_VERSION,
+            }
+        );
+    }
+
+    #[test]
+    fn transport_errors_retry_but_disagreement_does_not() {
+        assert!(framing_error_is_retryable(&FramingError::UnexpectedEof));
+        assert!(framing_error_is_retryable(&FramingError::Io(
+            std::io::Error::other("reset")
+        )));
+        // Retrying a decode failure would spin forever: the bytes will not
+        // become decodable on a second attempt.
+        assert!(!framing_error_is_retryable(&FramingError::Bincode(
+            "bad tag".into()
+        )));
+        assert!(!framing_error_is_retryable(&FramingError::Oversized {
+            claimed: usize::MAX,
+            max: MAX_HOST_FRAME_SIZE,
+        }));
+    }
+
+    #[test]
+    fn an_oversized_length_prefix_is_refused_without_allocating() {
+        // A corrupted prefix must not turn into a huge allocation.
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&u32::MAX.to_le_bytes());
+        let result = read_frame::<_, FromHost>(&mut buffer.as_slice());
+        assert!(matches!(result, Err(FramingError::Oversized { .. })));
+    }
+
+    #[test]
+    fn a_truncated_frame_reports_eof_rather_than_garbage() {
+        let mut buffer = Vec::new();
+        write_frame(
+            &mut buffer,
+            &FromHost::Data {
+                channel: 1,
+                bytes: vec![1, 2, 3, 4, 5],
+            },
+        )
+        .unwrap();
+        buffer.truncate(buffer.len() - 2);
+
+        let result = read_frame::<_, FromHost>(&mut buffer.as_slice());
+        assert!(
+            matches!(result, Err(FramingError::UnexpectedEof)),
+            "expected EOF, got {result:?}"
+        );
+    }
+}

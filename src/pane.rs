@@ -979,6 +979,10 @@ impl LocalPid {
     }
 
     /// A local process whose pid is already known.
+    ///
+    /// Only the handoff-import path constructs one this way, and that path is
+    /// Unix-only, so on Windows this has no caller.
+    #[cfg_attr(windows, allow(dead_code))]
     fn known(pid: u32) -> Self {
         Self(Arc::new(AtomicU32::new(pid)))
     }
