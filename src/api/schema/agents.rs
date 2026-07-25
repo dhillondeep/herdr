@@ -192,6 +192,9 @@ pub struct AgentInfo {
     /// Machine this agent's workspace is bound to. Absent means local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Detail the agent reported with its state, such as what it is waiting for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

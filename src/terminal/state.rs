@@ -1689,6 +1689,22 @@ impl TerminalState {
             })
     }
 
+    /// Human-readable detail the agent reported alongside its state, if any.
+    ///
+    /// Agents already send this through `pane.report_agent`, and until now it was
+    /// stored and never read. It is the closest thing to "what this agent
+    /// actually needs", which is exactly what a fleet view has to show when
+    /// several agents are blocked at once.
+    ///
+    /// Gated on the authority being effective, for the same reason as the label:
+    /// a suppressed report must not leak a stale message.
+    pub fn hook_message(&self) -> Option<&str> {
+        self.hook_authority
+            .as_ref()
+            .filter(|authority| self.hook_authority_is_effective(authority))
+            .and_then(|authority| authority.message.as_deref())
+    }
+
     pub fn effective_known_agent(&self) -> Option<Agent> {
         self.effective_agent_label()
             .and_then(crate::detect::parse_agent_label)
@@ -5306,6 +5322,72 @@ mod tests {
         assert_eq!(
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hook_message_tests {
+    use super::*;
+
+    fn report(state: &mut TerminalState, agent_state: AgentState, message: Option<&str>, seq: u64) {
+        state.set_hook_authority_with_session_ref(
+            "coder:claude".to_string(),
+            "claude".to_string(),
+            agent_state,
+            message.map(str::to_string),
+            None,
+            Some(seq),
+        );
+    }
+
+    #[test]
+    fn a_reported_message_is_readable() {
+        // It was previously stored and never read by anything, so an agent could
+        // say what it needed and nothing would show it.
+        let mut state = TerminalState::new(TerminalId::alloc(), "/tmp".into());
+        report(
+            &mut state,
+            AgentState::Blocked,
+            Some("waiting for permission to run tests"),
+            1,
+        );
+
+        assert_eq!(
+            state.hook_message(),
+            Some("waiting for permission to run tests")
+        );
+    }
+
+    #[test]
+    fn no_message_reads_as_absent_not_empty() {
+        let mut state = TerminalState::new(TerminalId::alloc(), "/tmp".into());
+        report(&mut state, AgentState::Working, None, 1);
+        assert_eq!(state.hook_message(), None);
+    }
+
+    #[test]
+    fn a_newer_report_replaces_the_previous_message() {
+        // A stale "waiting for X" left over after the agent moved on would be
+        // worse than showing nothing.
+        let mut state = TerminalState::new(TerminalId::alloc(), "/tmp".into());
+        report(&mut state, AgentState::Blocked, Some("needs a decision"), 1);
+        report(&mut state, AgentState::Working, None, 2);
+
+        assert_eq!(state.hook_message(), None);
+    }
+
+    #[test]
+    fn a_released_agent_reports_no_message() {
+        let mut state = TerminalState::new(TerminalId::alloc(), "/tmp".into());
+        report(&mut state, AgentState::Blocked, Some("needs a decision"), 1);
+        assert!(state.hook_message().is_some());
+
+        state.clear_hook_authority_with_mutation(Some("coder:claude"), Some(2));
+        assert_eq!(
+            state.hook_message(),
+            None,
+            "a cleared authority must not leave its message behind"
         );
     }
 }

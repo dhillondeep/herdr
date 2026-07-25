@@ -372,6 +372,7 @@ impl App {
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             host: ws.host.as_ref().map(|host| host.to_string()),
+            message: terminal.hook_message().map(str::to_string),
             name: terminal.agent_name.clone(),
             agent: pane.agent,
             title: pane.title,

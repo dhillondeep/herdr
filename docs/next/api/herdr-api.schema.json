@@ -6054,6 +6054,13 @@
             "launch_pending": {
               "type": "boolean"
             },
+            "message": {
+              "description": "Detail the agent reported with its state, such as what it is waiting for.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "name": {
               "type": [
                 "string",
