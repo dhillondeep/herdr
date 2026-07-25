@@ -274,6 +274,61 @@ fn spawn_heartbeat(stream: &mut UnixStream, channel: u64, heartbeat: &std::path:
 }
 
 #[test]
+fn the_attach_bridge_delivers_the_handshake_without_waiting_for_the_stream_to_end() {
+    // The gap that let a real bug through. Every other test here talks to the daemon's
+    // socket directly, so nothing exercised `pty-host attach` — the bridge ssh actually
+    // runs. It forwarded with `std::io::copy` into Rust's block-buffered stdout, so the
+    // Welcome sat in the buffer until the stream closed: by hand with a file on stdin it
+    // looked perfect, because EOF flushed it, while every real connection hung for the
+    // full handshake deadline and then failed with a timeout that named nothing useful.
+    //
+    // So the assertion is specifically that a frame arrives while stdin is still OPEN.
+    let socket = scratch("attach-flush");
+    let _ = std::fs::remove_file(&socket);
+
+    let mut child = Command::new(binary())
+        .arg("pty-host")
+        .arg("attach")
+        .env("HERDR_PTY_HOST_SOCKET", &socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn attach");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+
+    client::write(
+        &mut stdin,
+        &ToHost::Hello {
+            version: HOST_PROTOCOL_VERSION,
+        },
+    )
+    .expect("hello");
+
+    // Deliberately does NOT drop stdin: holding it open is the whole point.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(client::read::<_, FromHost>(&mut stdout));
+    });
+
+    let welcome = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the bridge must forward the welcome while stdin is still open")
+        .expect("a decodable welcome");
+    match welcome {
+        FromHost::Welcome { version, .. } => assert_eq!(version, HOST_PROTOCOL_VERSION),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
 fn a_process_outlives_the_client_that_asked_for_it() {
     let socket = scratch("sock");
     let heartbeat = scratch("beat");

@@ -660,6 +660,12 @@ fn poisoned() -> std::io::Error {
 /// Where the daemon listens on a host. Per-user, so two accounts on one machine do
 /// not collide.
 fn default_socket_path() -> std::path::PathBuf {
+    // Overridable so `attach` can be driven against a scratch daemon in tests. The
+    // bridge is the one part of this that only a real connection exercises, so it
+    // needs to be reachable without one.
+    if let Some(path) = std::env::var_os("HERDR_PTY_HOST_SOCKET") {
+        return std::path::PathBuf::from(path);
+    }
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -766,9 +772,26 @@ pub fn attach() -> std::io::Result<()> {
         let _ = writer.shutdown(std::net::Shutdown::Write);
     });
 
+    // NOT `std::io::copy`. Rust's stdout is block-buffered, and `copy` only flushes
+    // when the buffer fills or the stream ends — so on a framed protocol the reply to
+    // the handshake sits in the buffer while the client waits out its deadline, and
+    // the connection appears to hang rather than fail. Every frame has to be pushed
+    // as soon as it exists, because the far side is waiting on it before it will send
+    // anything more.
+    //
+    // This is invisible to any test that drives the daemon's socket directly, which is
+    // why it survived until a real connection tried it.
     let mut stdout = std::io::stdout().lock();
-    let _ = std::io::copy(&mut reader, &mut stdout);
-    let _ = stdout.flush();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if stdout.write_all(&buffer[..read]).is_err() || stdout.flush().is_err() {
+            break;
+        }
+    }
     let _ = pump.join();
     Ok(())
 }
