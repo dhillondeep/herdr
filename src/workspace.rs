@@ -1082,16 +1082,38 @@ impl Workspace {
             .unwrap_or_else(|| "workspace".into())
     }
 
+    /// Whether git state for this workspace can be trusted.
+    ///
+    /// Every cached git value comes from running `git` on THIS machine against the
+    /// workspace's identity cwd. For a workspace bound to a host that is the wrong
+    /// machine: at best the path does not exist and the answer is empty, at worst it
+    /// does exist locally and the answer describes a completely different
+    /// repository — a branch and ahead/behind count belonging to some unrelated
+    /// checkout that happens to share a path.
+    ///
+    /// Reporting nothing is the honest answer until git runs on the host. Gated on
+    /// read rather than on write because several paths populate the cache, and a
+    /// wrong branch shown once is worse than a missing one shown always.
+    fn git_state_is_meaningful(&self) -> bool {
+        self.host.is_none()
+    }
+
     pub fn branch(&self) -> Option<String> {
-        self.cached_git_branch.clone()
+        self.git_state_is_meaningful()
+            .then(|| self.cached_git_branch.clone())
+            .flatten()
     }
 
     pub fn git_ahead_behind(&self) -> Option<(usize, usize)> {
-        self.cached_git_ahead_behind
+        self.git_state_is_meaningful()
+            .then_some(self.cached_git_ahead_behind)
+            .flatten()
     }
 
     pub fn git_space(&self) -> Option<&GitSpaceMetadata> {
-        self.cached_git_space.as_ref()
+        self.git_state_is_meaningful()
+            .then_some(self.cached_git_space.as_ref())
+            .flatten()
     }
 
     pub fn worktree_space(&self) -> Option<&WorktreeSpaceMembership> {
@@ -1623,5 +1645,61 @@ mod tests {
         assert_eq!(ws.tabs[2].root_pane, moved_root);
         assert_eq!(ws.tabs[ws.active_tab].root_pane, active_root);
         ws.assert_invariants_for_test();
+    }
+}
+
+#[cfg(test)]
+mod remote_git_tests {
+    use super::*;
+
+    fn workspace_with_local_git_cache() -> Workspace {
+        let mut ws = Workspace::test_new("spaces");
+        ws.cached_git_branch = Some("feature/local-branch".to_string());
+        ws.cached_git_ahead_behind = Some((3, 1));
+        ws.cached_git_space = Some(GitSpaceMetadata {
+            key: "repo-key".to_string(),
+            checkout_key: "checkout-key".to_string(),
+            label: "repo".to_string(),
+            repo_root: std::path::PathBuf::from("/Users/someone/repo"),
+            is_linked_worktree: false,
+        });
+        ws
+    }
+
+    #[test]
+    fn a_local_workspace_reports_its_git_state() {
+        let ws = workspace_with_local_git_cache();
+        assert_eq!(ws.branch().as_deref(), Some("feature/local-branch"));
+        assert_eq!(ws.git_ahead_behind(), Some((3, 1)));
+        assert!(ws.git_space().is_some());
+    }
+
+    #[test]
+    fn a_host_bound_workspace_reports_no_git_state() {
+        // The cache was filled by running git on THIS machine, so for a workspace
+        // whose files live elsewhere it describes the wrong repository. Showing a
+        // branch from an unrelated local checkout is worse than showing none.
+        let mut ws = workspace_with_local_git_cache();
+        ws.host = crate::host::HostId::parse("coder.box1");
+
+        assert_eq!(ws.branch(), None);
+        assert_eq!(ws.git_ahead_behind(), None);
+        assert!(ws.git_space().is_none());
+    }
+
+    #[test]
+    fn binding_a_host_hides_git_state_that_was_already_cached() {
+        // The order matters: a workspace can acquire a host after git has already
+        // run against a local path, so gating on read has to cover a populated
+        // cache, not just an empty one.
+        let mut ws = workspace_with_local_git_cache();
+        assert!(ws.branch().is_some());
+
+        ws.host = crate::host::HostId::parse("coder.box1");
+        assert_eq!(
+            ws.branch(),
+            None,
+            "a cache populated before the binding must not leak afterwards"
+        );
     }
 }
