@@ -59,9 +59,13 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 /// Run through `sh -c`, never a login shell: anything a profile echoes to stdout
 /// would land in front of the handshake and corrupt the framed stream. Must
 /// contain no single quotes, since it is single-quoted for the remote shell.
+///
+/// `attach`, not the daemon itself: attach bridges stdio to a detached daemon that
+/// already holds the PTYs, so the processes are not children of this ssh invocation
+/// and survive it being torn down.
 const REMOTE_LAUNCH: &str = concat!(
-    "if command -v herdr >/dev/null 2>&1; then exec herdr pty-host; ",
-    "else exec \"$HOME/.local/bin/herdr\" pty-host; fi"
+    "if command -v herdr >/dev/null 2>&1; then exec herdr pty-host attach; ",
+    "else exec \"$HOME/.local/bin/herdr\" pty-host attach; fi"
 );
 
 impl HostLink {

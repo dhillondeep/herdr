@@ -34,29 +34,90 @@ struct Channel {
     pid: u32,
 }
 
-/// Serialised access to stdout: several reader threads report on one stream.
-type SharedOut = Arc<Mutex<Box<dyn Write + Send>>>;
+/// Serialised access to the attached client, if any.
+///
+/// `None` while nobody is attached. Output produced then is discarded rather than
+/// buffered: agents must keep running while the human is away, and holding every
+/// byte in memory for an unbounded absence is how a daemon gets OOM-killed. A byte
+/// log with bounded replay is the next step; until then a reattach shows the screen
+/// from that moment on.
+type SharedOut = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// Everything the daemon owns, independent of any one client.
+///
+/// Held across client disconnects so agents keep running when the link drops.
+struct Daemon {
+    channels: Arc<Mutex<HashMap<ChannelId, Channel>>>,
+    out: SharedOut,
+    exit_tx: mpsc::Sender<(ChannelId, Option<i32>)>,
+}
+
+impl Daemon {
+    fn new() -> Self {
+        let out: SharedOut = Arc::new(Mutex::new(None));
+        let channels: Arc<Mutex<HashMap<ChannelId, Channel>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Exits are reported from reader threads; a channel keeps that off the
+        // request path so a wedged reader cannot stall input handling.
+        let (exit_tx, exit_rx) = mpsc::channel::<(ChannelId, Option<i32>)>();
+        {
+            let out = Arc::clone(&out);
+            let channels = Arc::clone(&channels);
+            std::thread::spawn(move || {
+                while let Ok((channel, status)) = exit_rx.recv() {
+                    channels.lock().ok().map(|mut map| map.remove(&channel));
+                    send(&out, &FromHost::Exited { channel, status });
+                }
+            });
+        }
+
+        Self {
+            channels,
+            out,
+            exit_tx,
+        }
+    }
+
+    fn live_channels(&self) -> usize {
+        self.channels.lock().map(|map| map.len()).unwrap_or(0)
+    }
+}
 
 /// Run the daemon against the given streams until the input closes.
 ///
-/// Split from `run()` so it can be driven over pipes in tests without ssh.
-pub fn serve<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> std::io::Result<()> {
-    let out: SharedOut = Arc::new(Mutex::new(output));
-    let channels: Arc<Mutex<HashMap<ChannelId, Channel>>> = Arc::new(Mutex::new(HashMap::new()));
+/// Split from `run()` so it can be driven over pipes in tests without ssh. Owns a
+/// fresh Daemon, so this is the one-client-then-exit shape used by tests and by a
+/// direct `herdr pty-host` invocation.
+pub fn serve<R: Read>(input: R, output: Box<dyn Write + Send>) -> std::io::Result<()> {
+    let daemon = Daemon::new();
+    serve_client(&daemon, input, output)?;
 
-    // Exits are reported from reader threads; a channel keeps that off the
-    // request path so a wedged reader cannot stall input handling.
-    let (exit_tx, exit_rx) = mpsc::channel::<(ChannelId, Option<i32>)>();
-    {
-        let out = Arc::clone(&out);
-        let channels = Arc::clone(&channels);
-        std::thread::spawn(move || {
-            while let Ok((channel, status)) = exit_rx.recv() {
-                channels.lock().ok().map(|mut map| map.remove(&channel));
-                send(&out, &FromHost::Exited { channel, status });
-            }
-        });
+    // Tear down anything still running; a one-shot session must not leave
+    // orphaned shells behind on the machine.
+    let ids: Vec<ChannelId> = daemon
+        .channels
+        .lock()
+        .map(|map| map.keys().copied().collect())
+        .unwrap_or_default();
+    for channel in ids {
+        shutdown_channel(&daemon.channels, channel);
     }
+    Ok(())
+}
+
+/// Serve one attached client. Returns when its input closes; channels survive.
+fn serve_client<R: Read>(
+    daemon: &Daemon,
+    mut input: R,
+    output: Box<dyn Write + Send>,
+) -> std::io::Result<()> {
+    if let Ok(mut guard) = daemon.out.lock() {
+        *guard = Some(output);
+    }
+    let out = &daemon.out;
+    let channels = &daemon.channels;
+    let exit_tx = &daemon.exit_tx;
 
     let mut greeted = false;
 
@@ -68,7 +129,7 @@ pub fn serve<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> std::io::R
                 // Always answer, even on mismatch: the local side needs our
                 // version to tell the user which end to upgrade.
                 send(
-                    &out,
+                    out,
                     &FromHost::Welcome {
                         version: HOST_PROTOCOL_VERSION,
                     },
@@ -83,19 +144,16 @@ pub fn serve<R: Read>(mut input: R, output: Box<dyn Write + Send>) -> std::io::R
                 if !greeted {
                     break;
                 }
-                handle(other, &out, &channels, &exit_tx);
+                handle(other, out, channels, exit_tx);
             }
         }
     }
 
-    // Tear down anything still running; this process exiting must not leave
-    // orphaned shells behind on the machine.
-    let ids: Vec<ChannelId> = channels
-        .lock()
-        .map(|map| map.keys().copied().collect())
-        .unwrap_or_default();
-    for channel in ids {
-        shutdown_channel(&channels, channel);
+    // Deliberately does NOT tear down channels: the client going away is the
+    // normal case — a closed laptop, a dropped link — and killing the agents then
+    // is exactly the failure this daemon exists to prevent.
+    if let Ok(mut guard) = daemon.out.lock() {
+        *guard = None;
     }
 
     Ok(())
@@ -278,11 +336,17 @@ fn shutdown_channel(channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>, channel:
 }
 
 fn send(out: &SharedOut, message: &FromHost) {
-    if let Ok(mut writer) = out.lock() {
-        // A write failure means the local side is gone; the read loop will see
-        // EOF and shut everything down, so there is nothing useful to do here.
-        let _ = write_frame(&mut *writer, message);
-        let _ = writer.flush();
+    let Ok(mut guard) = out.lock() else {
+        return;
+    };
+    let Some(writer) = guard.as_mut() else {
+        // Nobody attached. Dropping this is deliberate — see SharedOut.
+        return;
+    };
+    if write_frame(writer, message).is_err() || writer.flush().is_err() {
+        // The client vanished mid-write. Detach it so later output is discarded
+        // cheaply instead of retrying into a dead pipe on every frame.
+        *guard = None;
     }
 }
 
@@ -290,9 +354,144 @@ fn poisoned() -> std::io::Error {
     std::io::Error::other("pty-host channel table poisoned")
 }
 
+/// Where the daemon listens on a host. Per-user, so two accounts on one machine do
+/// not collide.
+fn default_socket_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("herdr-pty-host.sock")
+}
+
+/// Serve clients on a unix socket until no channel is left to serve.
+///
+/// One client at a time: a second attach waits for the first to finish, which is
+/// simpler than multiplexing and matches how the local side behaves. Channels
+/// outlive each client, which is the whole point — a dropped link must not take the
+/// agents with it.
+pub fn serve_socket(socket_path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // A socket left by a previous daemon would make bind fail. Removing it is safe
+    // because a live daemon holds the lock file, checked by the caller.
+    let _ = std::fs::remove_file(socket_path);
+    let listener = std::os::unix::net::UnixListener::bind(socket_path)?;
+    // Only this user should be able to drive PTYs on their account.
+    let _ = std::fs::set_permissions(
+        socket_path,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    );
+
+    let daemon = Daemon::new();
+
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else {
+            continue;
+        };
+        let reader = stream.try_clone()?;
+        let _ = serve_client(&daemon, reader, Box::new(stream));
+
+        // Exit once there is nothing left to keep alive, so an idle daemon does not
+        // linger, while a busy one survives any number of reconnects.
+        if daemon.live_channels() == 0 {
+            break;
+        }
+    }
+
+    let _ = std::fs::remove_file(socket_path);
+    Ok(())
+}
+
+/// Connect to the daemon, starting it if needed, and bridge stdio to it.
+///
+/// This is what ssh runs. Mirrors `run_remote_client_bridge`: the transport only
+/// has to move bytes, so the process holding the PTYs is never a child of the ssh
+/// invocation and survives it.
+pub fn attach() -> std::io::Result<()> {
+    let socket_path = default_socket_path();
+
+    let stream = connect_or_start(&socket_path)?;
+
+    let mut reader = stream.try_clone()?;
+    let mut writer = stream;
+
+    // stdin -> daemon on a thread, daemon -> stdout here.
+    let pump = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let _ = std::io::copy(&mut stdin, &mut writer);
+        // Closing our write half tells the daemon this client is done.
+        let _ = writer.shutdown(std::net::Shutdown::Write);
+    });
+
+    let mut stdout = std::io::stdout().lock();
+    let _ = std::io::copy(&mut reader, &mut stdout);
+    let _ = stdout.flush();
+    let _ = pump.join();
+    Ok(())
+}
+
+/// Connect, or spawn a detached daemon and wait briefly for it to listen.
+fn connect_or_start(
+    socket_path: &std::path::Path,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket_path) {
+        return Ok(stream);
+    }
+
+    let exe = std::env::current_exe()?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("pty-host")
+        .arg("serve")
+        .arg("--socket")
+        .arg(socket_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // setsid, so the daemon is not in the ssh session's process group and does not
+    // receive its teardown signals.
+    crate::platform::detach_server_daemon_command(&mut command);
+    command.spawn()?;
+
+    // Poll rather than sleep a fixed time: startup is fast, and a fixed sleep is
+    // either wasted latency or too short on a loaded machine.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket_path) {
+            return Ok(stream);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(std::io::Error::other(
+        "pty-host daemon did not start listening",
+    ))
+}
+
 /// Entry point for the hidden `herdr pty-host` subcommand.
+///
+/// `attach` is what ssh runs. Bare `pty-host` keeps the one-shot stdio behaviour so
+/// tests can drive it over pipes without a daemon.
 pub fn run() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    serve(stdin.lock(), Box::new(stdout))
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    match args.first().map(String::as_str) {
+        Some("serve") => {
+            let socket = args
+                .iter()
+                .position(|arg| arg == "--socket")
+                .and_then(|index| args.get(index + 1))
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            serve_socket(&socket)
+        }
+        Some("attach") => attach(),
+        _ => {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            serve(stdin.lock(), Box::new(stdout))
+        }
+    }
 }
