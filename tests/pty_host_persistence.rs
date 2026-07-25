@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod client {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 1;
+    pub const HOST_PROTOCOL_VERSION: u32 = 2;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -50,15 +50,54 @@ mod client {
         Shutdown {
             channel: u64,
         },
+        Attach {
+            host_epoch: u64,
+            panes: Vec<(u64, u64)>,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum GoneReason {
+        ChildExited,
+        HostRestarted,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum FromHost {
-        Welcome { version: u32 },
-        Spawned { channel: u64, pid: u32 },
-        SpawnFailed { channel: u64, message: String },
-        Data { channel: u64, bytes: Vec<u8> },
-        Exited { channel: u64, status: Option<i32> },
+        Welcome {
+            version: u32,
+            host_epoch: u64,
+        },
+        Spawned {
+            channel: u64,
+            pid: u32,
+        },
+        SpawnFailed {
+            channel: u64,
+            message: String,
+        },
+        Data {
+            channel: u64,
+            bytes: Vec<u8>,
+        },
+        Exited {
+            channel: u64,
+            status: Option<i32>,
+        },
+        Replay {
+            channel: u64,
+            from: u64,
+            bytes: Vec<u8>,
+        },
+        Desync {
+            channel: u64,
+            available_from: u64,
+            out_offset: u64,
+        },
+        Gone {
+            channel: u64,
+            reason: GoneReason,
+        },
     }
 
     pub fn write<W: std::io::Write, M: Serialize>(
@@ -142,6 +181,10 @@ impl Daemon {
     }
 
     fn connect(&self) -> UnixStream {
+        self.connect_with_epoch().0
+    }
+
+    fn connect_with_epoch(&self) -> (UnixStream, u64) {
         let mut stream = UnixStream::connect(&self.socket).expect("connect");
         client::write(
             &mut stream,
@@ -150,11 +193,17 @@ impl Daemon {
             },
         )
         .expect("hello");
-        match client::read::<_, FromHost>(&mut stream).expect("welcome") {
-            FromHost::Welcome { version } => assert_eq!(version, HOST_PROTOCOL_VERSION),
+        let epoch = match client::read::<_, FromHost>(&mut stream).expect("welcome") {
+            FromHost::Welcome {
+                version,
+                host_epoch,
+            } => {
+                assert_eq!(version, HOST_PROTOCOL_VERSION);
+                host_epoch
+            }
             other => panic!("expected Welcome, got {other:?}"),
-        }
-        stream
+        };
+        (stream, epoch)
     }
 
     fn is_running(&mut self) -> bool {
@@ -186,8 +235,11 @@ fn spawn_heartbeat(stream: &mut UnixStream, channel: u64, heartbeat: &std::path:
                 argv: vec![
                     "sh".to_string(),
                     "-c".to_string(),
+                    // Emits to BOTH stdout and the file: the file proves the
+                    // process is alive without pattern-matching process names, and
+                    // the stdout is what the output log records for replay.
                     format!(
-                        "while :; do printf 'tick\\n' >> {}; sleep 0.1; done",
+                        "while :; do printf 'tick\\n'; printf 'tick\\n' >> {}; sleep 0.1; done",
                         heartbeat.display()
                     ),
                 ],
@@ -262,18 +314,30 @@ fn a_second_client_can_attach_after_the_first_leaves() {
 
     // A fresh client must be accepted and served, not refused because the daemon
     // is still holding the previous session.
+    //
+    // Its own heartbeat file, not the first channel's: sharing one would make the
+    // assertion unable to tell which channel produced the growth, and it would pass
+    // on the first channel's output alone.
+    let second_beat = scratch("beat2b");
+    let _ = std::fs::remove_file(&second_beat);
     let mut second = daemon.connect();
-    let before = heartbeat_lines(&heartbeat);
-    spawn_heartbeat(&mut second, 2, &heartbeat);
-    std::thread::sleep(Duration::from_millis(600));
+    spawn_heartbeat(&mut second, 2, &second_beat);
+
+    // Polled rather than a fixed sleep: the suite runs tests in parallel, so a
+    // fixed wait is load-sensitive and flaky.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && heartbeat_lines(&second_beat) < 2 {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     assert!(
-        heartbeat_lines(&heartbeat) > before,
-        "the reattached client should be able to start work"
+        heartbeat_lines(&second_beat) >= 2,
+        "the reattached client should be able to start work of its own"
     );
     assert!(daemon.is_running());
 
     let _ = std::fs::remove_file(&heartbeat);
+    let _ = std::fs::remove_file(&second_beat);
 }
 
 #[test]
@@ -318,4 +382,178 @@ fn the_daemon_exits_once_nothing_is_left_to_serve() {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("daemon should exit once no channel is live and no client is attached");
+}
+
+/// Read frames until one concerns `channel`, so unrelated live output does not
+/// confuse the assertion.
+fn next_for_channel(stream: &mut UnixStream, channel: u64) -> FromHost {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match client::read::<_, FromHost>(stream) {
+            Ok(message) => {
+                let concerns = match &message {
+                    FromHost::Replay { channel: c, .. }
+                    | FromHost::Desync { channel: c, .. }
+                    | FromHost::Gone { channel: c, .. } => *c == channel,
+                    _ => false,
+                };
+                if concerns {
+                    return message;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    panic!("no resume answer for channel {channel}");
+}
+
+#[test]
+fn reattaching_with_a_current_offset_replays_what_was_missed() {
+    let socket = scratch("resume-ok");
+    let heartbeat = scratch("resume-ok-beat");
+    let _ = std::fs::remove_file(&heartbeat);
+
+    let daemon = Daemon::start(socket.clone());
+    let (mut first, epoch) = daemon.connect_with_epoch();
+    spawn_heartbeat(&mut first, 1, &heartbeat);
+    drop(first);
+
+    // Let the pane produce output with nobody attached — this is what must be
+    // replayable.
+    std::thread::sleep(Duration::from_millis(700));
+
+    let mut second = daemon.connect();
+    client::write(
+        &mut second,
+        &ToHost::Attach {
+            host_epoch: epoch,
+            panes: vec![(1, 0)],
+        },
+    )
+    .expect("attach");
+
+    match next_for_channel(&mut second, 1) {
+        FromHost::Replay { from, bytes, .. } => {
+            assert_eq!(from, 0);
+            assert!(
+                !bytes.is_empty(),
+                "output produced while detached should be replayed"
+            );
+        }
+        other => panic!("expected Replay, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&heartbeat);
+}
+
+#[test]
+fn reattaching_after_the_daemon_restarted_reports_gone_not_a_stale_frame() {
+    // The distinction that matters most: a wrong epoch must never resume, however
+    // plausible the offsets look, or the client would show a frame for a pane whose
+    // agent no longer exists.
+    let socket = scratch("resume-epoch");
+    let heartbeat = scratch("resume-epoch-beat");
+    let _ = std::fs::remove_file(&heartbeat);
+
+    let daemon = Daemon::start(socket.clone());
+    let (mut first, epoch) = daemon.connect_with_epoch();
+    spawn_heartbeat(&mut first, 1, &heartbeat);
+    drop(first);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut second = daemon.connect();
+    client::write(
+        &mut second,
+        &ToHost::Attach {
+            // A different epoch, as a client would hold after the daemon restarted.
+            host_epoch: epoch.wrapping_add(1),
+            panes: vec![(1, 0)],
+        },
+    )
+    .expect("attach");
+
+    match next_for_channel(&mut second, 1) {
+        FromHost::Gone { reason, .. } => {
+            assert_eq!(reason, client::GoneReason::HostRestarted);
+        }
+        other => panic!("expected Gone/HostRestarted, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&heartbeat);
+}
+
+#[test]
+fn reattaching_to_a_finished_pane_reports_gone_child_exited() {
+    let socket = scratch("resume-exited");
+    let daemon = Daemon::start(socket.clone());
+    let (mut first, epoch) = daemon.connect_with_epoch();
+
+    client::write(
+        &mut first,
+        &ToHost::Spawn {
+            channel: 1,
+            spec: SpawnSpec {
+                argv: vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()],
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+        },
+    )
+    .expect("spawn");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match client::read::<_, FromHost>(&mut first) {
+            Ok(FromHost::Exited { .. }) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    client::write(
+        &mut first,
+        &ToHost::Attach {
+            host_epoch: epoch,
+            panes: vec![(1, 0)],
+        },
+    )
+    .expect("attach");
+
+    match next_for_channel(&mut first, 1) {
+        FromHost::Gone { reason, .. } => assert_eq!(reason, client::GoneReason::ChildExited),
+        other => panic!("expected Gone/ChildExited, got {other:?}"),
+    }
+}
+
+#[test]
+fn reattaching_with_an_impossible_offset_desyncs_rather_than_guessing() {
+    // An offset the daemon never produced cannot be resumed from. Sending nothing
+    // would look like a healthy idle pane.
+    let socket = scratch("resume-desync");
+    let heartbeat = scratch("resume-desync-beat");
+    let _ = std::fs::remove_file(&heartbeat);
+
+    let daemon = Daemon::start(socket.clone());
+    let (mut stream, epoch) = daemon.connect_with_epoch();
+    spawn_heartbeat(&mut stream, 1, &heartbeat);
+
+    client::write(
+        &mut stream,
+        &ToHost::Attach {
+            host_epoch: epoch,
+            panes: vec![(1, u64::MAX / 2)],
+        },
+    )
+    .expect("attach");
+
+    match next_for_channel(&mut stream, 1) {
+        FromHost::Desync { out_offset, .. } => {
+            assert!(out_offset < u64::MAX / 2);
+        }
+        other => panic!("expected Desync, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(&heartbeat);
 }

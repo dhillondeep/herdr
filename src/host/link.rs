@@ -295,7 +295,7 @@ fn dispatch_from_host<R: Read>(
         // than waiting out the deadline.
         if let Some(tx) = welcome.take() {
             let _ = match &message {
-                FromHost::Welcome { version } => tx.send(Ok(*version)),
+                FromHost::Welcome { version, .. } => tx.send(Ok(*version)),
                 other => tx.send(Err(format!(
                     "expected a welcome from the host, got {other:?}"
                 ))),
@@ -322,6 +322,10 @@ fn dispatch_from_host<R: Read>(
                 close_channel(&channels, channel);
             }
             FromHost::Spawned { .. } | FromHost::Welcome { .. } => {}
+            // The local side does not send Attach yet, so it cannot receive these.
+            // Ignored rather than unreachable!(): a daemon that sends one anyway
+            // must not take the client down with it.
+            FromHost::Replay { .. } | FromHost::Desync { .. } | FromHost::Gone { .. } => {}
         }
     }
 

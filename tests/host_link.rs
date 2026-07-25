@@ -111,7 +111,7 @@ mod client {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum FromHost {
-        Welcome { version: u32 },
+        Welcome { version: u32, host_epoch: u64 },
         Spawned { channel: u64, pid: u32 },
         SpawnFailed { channel: u64, message: String },
         Data { channel: u64, bytes: Vec<u8> },
@@ -157,7 +157,7 @@ impl Bridge {
     fn spawn(argv: &[&str], rows: u16, cols: u16) -> Self {
         let (daemon, mut stdout, mut stdin) = Daemon::start();
 
-        client::write(&mut stdin, &ToHost::Hello { version: 1 }).expect("hello");
+        client::write(&mut stdin, &ToHost::Hello { version: 2 }).expect("hello");
         let welcome: FromHost = client::read(&mut stdout).expect("welcome");
         assert!(matches!(welcome, FromHost::Welcome { .. }));
 

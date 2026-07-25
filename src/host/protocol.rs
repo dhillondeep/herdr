@@ -20,10 +20,16 @@ pub use crate::protocol::wire::FramingError;
 /// per machine and may lag, so compatibility is a *range* rather than equality —
 /// see [`negotiate`]. Exact-match versioning here would mean one stale host
 /// bricks that host until re-provisioned.
-pub const HOST_PROTOCOL_VERSION: u32 = 1;
+pub const HOST_PROTOCOL_VERSION: u32 = 2;
 
 /// Oldest host protocol this build can still talk to.
-pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 1;
+///
+/// Raised to 2 with session identity: the framing is positional, so a version-1
+/// daemon's `Welcome` cannot be decoded by a version-2 client. Nothing is released
+/// yet, so there is no back-compatibility to keep — and a host running the older
+/// binary now reports a clear version mismatch telling the user to re-provision,
+/// which `herdr host install` makes a one-liner.
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 2;
 
 /// Cap on a single host frame. Output is chunked well below this; the cap exists
 /// so a corrupted length prefix cannot make us allocate wildly.
@@ -81,14 +87,47 @@ pub enum ToHost {
     Shutdown {
         channel: ChannelId,
     },
+    /// Reconnecting: here is the epoch I last saw and how far I had read on each
+    /// pane. Tell me, per pane, whether I can resume.
+    ///
+    /// Offsets are per pane rather than one stream position because panes are
+    /// independent and a busy one must not decide the fate of a quiet one.
+    Attach {
+        host_epoch: u64,
+        panes: Vec<(ChannelId, u64)>,
+    },
+}
+
+/// Why a pane the client remembered is no longer available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GoneReason {
+    /// Its process finished.
+    ChildExited,
+    /// The daemon restarted, so nothing from the previous epoch survived.
+    ///
+    /// Reported separately because the user-visible meaning differs: a finished
+    /// pane is done, whereas a host restart lost work. Showing one as the other is
+    /// the worst available outcome.
+    HostRestarted,
 }
 
 /// Daemon to local server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FromHost {
     /// Response to `Hello`, carrying the daemon's version so either side can
-    /// refuse a pairing it cannot support.
-    Welcome { version: u32 },
+    /// refuse a pairing it cannot support, plus who this daemon is.
+    Welcome {
+        version: u32,
+        /// Identifies this daemon instance. A different value means the daemon
+        /// restarted, so every channel a client remembers is gone.
+        ///
+        /// Distinguishing "the network died and the agents are alive" from "the
+        /// host restarted and the agents are gone" is the whole reason this
+        /// exists. Conflating them is the worst available outcome: the client
+        /// would show a plausible stale frame for a pane whose agent no longer
+        /// exists.
+        host_epoch: u64,
+    },
     /// A spawn succeeded. `pid` is the process id **on the host**, useful only
     /// for display and for the daemon's own bookkeeping — never for a local
     /// signal or a local `/proc` read.
@@ -101,6 +140,29 @@ pub enum FromHost {
     Exited {
         channel: ChannelId,
         status: Option<i32>,
+    },
+    /// The pane can resume: here are the bytes it missed, from `from` onwards.
+    /// Invisible to the user — this is the good case.
+    Replay {
+        channel: ChannelId,
+        from: u64,
+        bytes: Vec<u8>,
+    },
+    /// The pane is alive but the client is too far behind to be caught up without a
+    /// gap. It must resync from a fresh view and mark its scrollback truncated,
+    /// never continue as if nothing happened: a hole fed to a VT parser is
+    /// permanent corruption, not a missing frame.
+    Desync {
+        channel: ChannelId,
+        /// Oldest offset still held, for diagnostics.
+        available_from: u64,
+        /// Where the live stream is now.
+        out_offset: u64,
+    },
+    /// The pane no longer exists.
+    Gone {
+        channel: ChannelId,
+        reason: GoneReason,
     },
 }
 
@@ -222,6 +284,7 @@ mod tests {
         let messages = vec![
             FromHost::Welcome {
                 version: HOST_PROTOCOL_VERSION,
+                host_epoch: 42,
             },
             FromHost::Spawned {
                 channel: 1,
@@ -294,6 +357,20 @@ mod tests {
             bytes: bytes.clone(),
         };
 
+        let mut buffer = Vec::new();
+        write_frame(&mut buffer, &message).unwrap();
+        let decoded: FromHost = read_frame(&mut buffer.as_slice()).unwrap();
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn the_host_epoch_survives_the_wire() {
+        // Everything about telling "link died" from "host restarted" keys on this
+        // value, so it must round-trip exactly rather than approximately.
+        let message = FromHost::Welcome {
+            version: HOST_PROTOCOL_VERSION,
+            host_epoch: u64::MAX - 7,
+        };
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &message).unwrap();
         let decoded: FromHost = read_frame(&mut buffer.as_slice()).unwrap();

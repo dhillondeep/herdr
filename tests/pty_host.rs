@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 mod protocol {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 1;
+    pub const HOST_PROTOCOL_VERSION: u32 = 2;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -55,7 +55,7 @@ mod protocol {
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub enum FromHost {
-        Welcome { version: u32 },
+        Welcome { version: u32, host_epoch: u64 },
         Spawned { channel: u64, pid: u32 },
         SpawnFailed { channel: u64, message: String },
         Data { channel: u64, bytes: Vec<u8> },
@@ -130,7 +130,7 @@ impl Host {
             version: HOST_PROTOCOL_VERSION,
         });
         match host.recv() {
-            FromHost::Welcome { version } => assert_eq!(version, HOST_PROTOCOL_VERSION),
+            FromHost::Welcome { version, .. } => assert_eq!(version, HOST_PROTOCOL_VERSION),
             other => panic!("expected Welcome, got {other:?}"),
         }
         host

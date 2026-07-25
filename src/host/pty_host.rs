@@ -24,6 +24,73 @@ use super::protocol::{
 /// both sides of the link.
 const READ_CHUNK: usize = 8192;
 
+/// How much output is kept per channel for replay.
+///
+/// A compromise, and worth naming as one: an agent redrawing a status block at a
+/// couple of KB/s fills this in around ten minutes, so a short disconnect replays
+/// seamlessly while an overnight absence will need a snapshot instead. Raising it
+/// costs memory on a machine herdr does not own.
+const OUTPUT_LOG_CAPACITY: usize = 1024 * 1024;
+
+/// Bounded record of a channel's output, so a reconnecting client can be given the
+/// bytes it missed.
+///
+/// Bounded on purpose: a client may be away indefinitely, and keeping every byte is
+/// how a daemon gets OOM-killed on a host it does not own. Once the buffer overflows
+/// the oldest bytes are dropped and a client that far behind gets a `Desync` rather
+/// than a silent hole — a gap fed to a downstream VT parser is permanent grid
+/// corruption, not a dropped frame.
+#[derive(Debug)]
+struct OutputLog {
+    /// Offset of the oldest byte still held.
+    start: u64,
+    /// Total bytes ever produced on this channel.
+    end: u64,
+    buffer: std::collections::VecDeque<u8>,
+    capacity: usize,
+}
+
+impl OutputLog {
+    fn new(capacity: usize) -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            buffer: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.buffer.extend(bytes.iter().copied());
+        self.end += bytes.len() as u64;
+        // Trim from the front, advancing `start` by exactly what was dropped so the
+        // offset arithmetic stays exact.
+        while self.buffer.len() > self.capacity {
+            let excess = self.buffer.len() - self.capacity;
+            self.buffer.drain(..excess);
+            self.start += excess as u64;
+        }
+    }
+
+    /// Bytes from `offset` onwards, or `None` if they are no longer held.
+    ///
+    /// `None` means the caller must be told to resync rather than handed a partial
+    /// stream: returning what is left would leave a hole at the front.
+    fn since(&self, offset: u64) -> Option<Vec<u8>> {
+        if offset > self.end {
+            // Ahead of anything produced. Treat as unresumable rather than
+            // guessing: a client claiming a future offset is a bug somewhere, and
+            // silently sending nothing would look like a healthy idle pane.
+            return None;
+        }
+        if offset < self.start {
+            return None;
+        }
+        let skip = (offset - self.start) as usize;
+        Some(self.buffer.iter().skip(skip).copied().collect())
+    }
+}
+
 /// One live PTY.
 struct Channel {
     /// Write end of the PTY master, for user input.
@@ -32,6 +99,9 @@ struct Channel {
     master_fd: std::os::fd::RawFd,
     /// Pid of the child on this machine.
     pid: u32,
+    /// Output produced so far, for replay to a reconnecting client. Shared with the
+    /// reader thread so appending never has to lock the channel table.
+    log: Arc<Mutex<OutputLog>>,
 }
 
 /// Serialised access to the attached client, if any.
@@ -50,6 +120,21 @@ struct Daemon {
     channels: Arc<Mutex<HashMap<ChannelId, Channel>>>,
     out: SharedOut,
     exit_tx: mpsc::Sender<(ChannelId, Option<i32>)>,
+    /// Constant for the life of this process; see `mint_host_epoch`.
+    host_epoch: u64,
+}
+
+/// Identifies this daemon instance.
+///
+/// Process start time plus pid: unique per daemon without needing anywhere to
+/// persist it, and monotonic enough that a restarted daemon never reuses the value
+/// a client is holding.
+fn mint_host_epoch() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 48)
 }
 
 impl Daemon {
@@ -76,6 +161,7 @@ impl Daemon {
             channels,
             out,
             exit_tx,
+            host_epoch: mint_host_epoch(),
         }
     }
 
@@ -132,6 +218,7 @@ fn serve_client<R: Read>(
                     out,
                     &FromHost::Welcome {
                         version: HOST_PROTOCOL_VERSION,
+                        host_epoch: daemon.host_epoch,
                     },
                 );
                 if !matches!(negotiate(version), Negotiation::Ok) {
@@ -144,7 +231,7 @@ fn serve_client<R: Read>(
                 if !greeted {
                     break;
                 }
-                handle(other, out, channels, exit_tx);
+                handle(other, out, channels, exit_tx, daemon.host_epoch);
             }
         }
     }
@@ -159,11 +246,13 @@ fn serve_client<R: Read>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle(
     message: ToHost,
     out: &SharedOut,
     channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>,
     exit_tx: &mpsc::Sender<(ChannelId, Option<i32>)>,
+    daemon_epoch: u64,
 ) {
     match message {
         ToHost::Hello { .. } => {}
@@ -208,6 +297,62 @@ fn handle(
             }
         }
         ToHost::Shutdown { channel } => shutdown_channel(channels, channel),
+        ToHost::Attach { host_epoch, panes } => {
+            for (channel, offset) in panes {
+                send(
+                    out,
+                    &resume_decision(daemon_epoch, host_epoch, channels, channel, offset),
+                );
+            }
+        }
+    }
+}
+
+/// Decide, for one pane, whether a reconnecting client can resume.
+///
+/// Exactly one answer per pane, and the epoch is checked first: if the daemon
+/// restarted then nothing from the previous epoch survived, so offsets are
+/// meaningless and every pane is gone regardless of how far behind the client is.
+/// Checking offsets first would let a coincidental match resume a pane whose agent
+/// no longer exists, which is the worst outcome available here.
+fn resume_decision(
+    daemon_epoch: u64,
+    client_epoch: u64,
+    channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>,
+    channel: ChannelId,
+    offset: u64,
+) -> FromHost {
+    if client_epoch != daemon_epoch {
+        return FromHost::Gone {
+            channel,
+            reason: crate::host::protocol::GoneReason::HostRestarted,
+        };
+    }
+
+    let Some((bytes, start, end)) = channels.lock().ok().and_then(|map| {
+        let entry = map.get(&channel)?;
+        let log = entry.log.lock().ok()?;
+        Some((log.since(offset), log.start, log.end))
+    }) else {
+        // Same epoch but no such channel: its process finished while the client was
+        // away.
+        return FromHost::Gone {
+            channel,
+            reason: crate::host::protocol::GoneReason::ChildExited,
+        };
+    };
+
+    match bytes {
+        Some(bytes) => FromHost::Replay {
+            channel,
+            from: offset,
+            bytes,
+        },
+        None => FromHost::Desync {
+            channel,
+            available_from: start,
+            out_offset: end,
+        },
     }
 }
 
@@ -241,12 +386,15 @@ fn spawn_channel(
     };
     let writer_file = std::fs::File::from(spawned.master_fd);
 
+    let log = Arc::new(Mutex::new(OutputLog::new(OUTPUT_LOG_CAPACITY)));
+
     channels.lock().map_err(|_| poisoned())?.insert(
         channel,
         Channel {
             writer: Box::new(writer_file),
             master_fd,
             pid,
+            log: Arc::clone(&log),
         },
     );
 
@@ -260,13 +408,20 @@ fn spawn_channel(
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => send(
-                        &out,
-                        &FromHost::Data {
-                            channel,
-                            bytes: buffer[..n].to_vec(),
-                        },
-                    ),
+                    Ok(n) => {
+                        // Recorded before sending, so output produced while nobody
+                        // is attached is still replayable afterwards.
+                        if let Ok(mut log) = log.lock() {
+                            log.append(&buffer[..n]);
+                        }
+                        send(
+                            &out,
+                            &FromHost::Data {
+                                channel,
+                                bytes: buffer[..n].to_vec(),
+                            },
+                        );
+                    }
                 }
             }
             let status = child.wait().ok().map(|status| status.exit_code() as i32);
@@ -528,6 +683,132 @@ pub fn run() -> std::io::Result<()> {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
             serve(stdin.lock(), Box::new(stdout))
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_log_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_log_holds_nothing_at_offset_zero() {
+        let log = OutputLog::new(16);
+        assert_eq!(log.since(0), Some(Vec::new()));
+        assert_eq!(log.start, 0);
+        assert_eq!(log.end, 0);
+    }
+
+    #[test]
+    fn replay_from_zero_returns_everything_while_it_fits() {
+        let mut log = OutputLog::new(16);
+        log.append(b"abc");
+        log.append(b"def");
+        assert_eq!(log.since(0), Some(b"abcdef".to_vec()));
+        assert_eq!(log.end, 6);
+    }
+
+    #[test]
+    fn replay_from_the_middle_returns_only_what_follows() {
+        let mut log = OutputLog::new(16);
+        log.append(b"abcdef");
+        assert_eq!(log.since(2), Some(b"cdef".to_vec()));
+        assert_eq!(log.since(5), Some(b"f".to_vec()));
+    }
+
+    #[test]
+    fn replay_from_the_end_returns_empty_not_none() {
+        // A caller fully caught up must continue live, not be told to resync.
+        let mut log = OutputLog::new(16);
+        log.append(b"abcdef");
+        assert_eq!(log.since(6), Some(Vec::new()));
+    }
+
+    #[test]
+    fn overflow_drops_the_oldest_bytes_and_advances_start_exactly() {
+        // The offset arithmetic is the whole point: if `start` and the dropped byte
+        // count ever disagree, every later replay is silently shifted.
+        let mut log = OutputLog::new(4);
+        log.append(b"abcdef");
+
+        assert_eq!(log.end, 6);
+        assert_eq!(log.start, 2, "two bytes were dropped");
+        assert_eq!(log.since(2), Some(b"cdef".to_vec()));
+    }
+
+    #[test]
+    fn an_offset_older_than_the_buffer_is_unresumable() {
+        // Returning the remaining bytes here would leave a hole at the front, and a
+        // hole fed to a VT parser is permanent corruption rather than a lost frame.
+        let mut log = OutputLog::new(4);
+        log.append(b"abcdef");
+        assert_eq!(log.since(0), None);
+        assert_eq!(log.since(1), None);
+        assert_eq!(log.since(2), Some(b"cdef".to_vec()));
+    }
+
+    #[test]
+    fn an_offset_beyond_what_was_produced_is_unresumable() {
+        // A client claiming a future offset is a bug somewhere; sending nothing
+        // would look like a healthy idle pane.
+        let mut log = OutputLog::new(16);
+        log.append(b"abc");
+        assert_eq!(log.since(4), None);
+        assert_eq!(log.since(u64::MAX), None);
+    }
+
+    #[test]
+    fn many_small_appends_keep_offsets_consistent() {
+        // Exercises the trim path repeatedly, which is where an off-by-one would
+        // accumulate rather than show up once.
+        let mut log = OutputLog::new(8);
+        for index in 0..100u8 {
+            log.append(&[index]);
+        }
+
+        assert_eq!(log.end, 100);
+        assert_eq!(log.start, 92);
+        let tail = log.since(92).expect("tail should be held");
+        assert_eq!(tail, (92u8..100).collect::<Vec<u8>>());
+        assert_eq!(log.since(91), None);
+    }
+
+    #[test]
+    fn a_single_append_larger_than_capacity_keeps_only_the_tail() {
+        let mut log = OutputLog::new(3);
+        log.append(b"abcdefgh");
+        assert_eq!(log.end, 8);
+        assert_eq!(log.start, 5);
+        assert_eq!(log.since(5), Some(b"fgh".to_vec()));
+    }
+
+    #[test]
+    fn replay_bytes_always_line_up_with_the_offsets_reported() {
+        // The invariant that matters: for every resumable offset, what comes back is
+        // exactly the bytes from that offset to the end. Checked across a schedule of
+        // appends rather than at one point in time.
+        let mut log = OutputLog::new(10);
+        let mut produced: Vec<u8> = Vec::new();
+        let mut next = 0u8;
+
+        for chunk in [1usize, 4, 7, 2, 9, 3] {
+            let bytes: Vec<u8> = (0..chunk)
+                .map(|_| {
+                    next = next.wrapping_add(1);
+                    next
+                })
+                .collect();
+            log.append(&bytes);
+            produced.extend_from_slice(&bytes);
+
+            for offset in log.start..=log.end {
+                let replayed = log.since(offset).expect("offset within the window");
+                let expected = &produced[offset as usize..];
+                assert_eq!(
+                    replayed, expected,
+                    "replay from {offset} disagreed with what was produced"
+                );
+            }
         }
     }
 }
