@@ -14,12 +14,6 @@
 //! failure at `debug!`, so getting this wrong produces a pane that silently
 //! never resizes.
 
-// Consumed by PaneRuntimeIo::Remote, which lands next. Split out because the
-// link is fully exercisable on its own — the integration test drives it against a
-// real pty-host subprocess — whereas wiring a pane additionally means threading a
-// host through workspace and pane creation.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -51,6 +45,53 @@ pub struct HostLink {
 }
 
 impl HostLink {
+    /// Connect to a host by running `herdr pty-host` there over ssh.
+    ///
+    /// ssh is only a way to carry stdio, so it is confined to this one function;
+    /// everything else works on streams and is exercised over pipes in tests.
+    /// Keepalives are set so a dead link surfaces rather than hanging forever.
+    pub fn connect_over_ssh(target: &str) -> std::io::Result<(Self, std::process::Child)> {
+        let mut child = std::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ServerAliveInterval=30")
+            .arg("-o")
+            .arg("ServerAliveCountMax=6")
+            // No tty: this is a framed byte protocol, and a pty would mangle it.
+            .arg("-T")
+            .arg(target)
+            .arg("herdr")
+            .arg("pty-host")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("ssh produced no stdout"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ssh produced no stdin"))?;
+
+        match Self::connect(stdout, Box::new(stdin)) {
+            Ok(link) => Ok((link, child)),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The most common cause by far is no herdr on the remote PATH, and
+                // the raw framing error says nothing about that.
+                Err(std::io::Error::other(format!(
+                    "could not start herdr pty-host on {target}: {err}. \
+                     Check that herdr is installed there and on PATH."
+                )))
+            }
+        }
+    }
+
     /// Handshake over an already-established byte stream.
     ///
     /// Taking streams rather than spawning ssh keeps the transport out of this
@@ -117,6 +158,9 @@ impl HostLink {
         })
     }
 
+    /// Protocol version the host advertised. Surfaced for diagnostics: with many
+    /// hosts, version skew is the failure people hit most.
+    #[allow(dead_code)]
     pub fn peer_version(&self) -> u32 {
         self.peer_version
     }

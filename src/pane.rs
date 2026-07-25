@@ -1028,11 +1028,6 @@ pub struct PaneRuntime {
 
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
-    // Constructed by the remote spawn path, which lands next: it needs a small
-    // refactor of from_handoff_fd, the existing constructor that builds a runtime
-    // with no local child, so both paths share one body rather than duplicating
-    // terminal and detection setup.
-    #[allow(dead_code)]
     /// A pane whose process runs on another machine.
     ///
     /// Byte I/O still goes through the ordinary actor: its fd is one end of a
@@ -1623,6 +1618,27 @@ fn publish_reported_cwd(
     }
 }
 
+/// How a pane built from an existing fd reaches its process.
+///
+/// Both cases import a ready-made fd and have no child to `waitpid`, which is why
+/// they share one constructor: duplicating the terminal, render-hook and detection
+/// wiring would let the two drift apart.
+#[cfg(unix)]
+enum ImportedIo {
+    /// A real PTY master handed over during live handoff. The child is local.
+    LocalHandoff { child_pid: u32 },
+    /// A socket to a pty-host channel. The process is on another machine, so
+    /// there is no local pid and no local ioctl.
+    ///
+    /// Exercised end to end by `remote_pane_tests`; the production call site is
+    /// pane creation for a host-bound workspace, which lands next.
+    #[allow(dead_code)]
+    Remote {
+        link: std::sync::Arc<crate::host::link::HostLink>,
+        channel: crate::host::protocol::ChannelId,
+    },
+}
+
 impl PaneRuntime {
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
@@ -1885,10 +1901,95 @@ impl PaneRuntime {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
+        let child_pid = import.state.child_pid;
+        Self::from_imported_fd(
+            import,
+            ImportedIo::LocalHandoff { child_pid },
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            events,
+            render_notify,
+            render_dirty,
+        )
+    }
+
+    /// Build a pane whose process runs on another machine.
+    ///
+    /// `channel_fd` is the socket the link handed out for this channel; it behaves
+    /// like a PTY master for reads and writes, which is why the ordinary actor can
+    /// drive it. Window size goes over the link instead of through an ioctl.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    // Called by remote_pane_tests today; pane creation for a host-bound workspace
+    // is the remaining wiring.
+    #[allow(dead_code)]
+    pub fn spawn_remote(
+        pane_id: PaneId,
+        link: std::sync::Arc<crate::host::link::HostLink>,
+        channel: crate::host::protocol::ChannelId,
+        channel_fd: std::os::fd::OwnedFd,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
+        use std::os::fd::IntoRawFd;
+
+        // Nothing to seed: a fresh remote pane has no prior terminal state. The
+        // fields exist for the handoff case, which resumes an existing pane.
+        let state = crate::handoff_runtime::HandoffRuntimeState {
+            pane_id: pane_id.raw(),
+            // Unused for a remote pane; the pid lives on the host and is never
+            // signalled or probed from here.
+            child_pid: 0,
+            rows,
+            cols,
+            cell_width_px,
+            cell_height_px,
+            keyboard_protocol_flags: 0,
+            keyboard_protocol_ansi: None,
+            input_state: None,
+            terminal_title: None,
+            initial_history_ansi: None,
+        };
+
+        Self::from_imported_fd(
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: channel_fd.into_raw_fd(),
+                state,
+            },
+            ImportedIo::Remote { link, channel },
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            events,
+            render_notify,
+            render_dirty,
+        )
+    }
+
+    /// Shared body for both imported-fd cases. See [`ImportedIo`].
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn from_imported_fd(
+        import: crate::handoff_runtime::ImportedHandoffRuntime,
+        io_kind: ImportedIo,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
         let crate::handoff_runtime::ImportedHandoffRuntime { master_fd, state } = import;
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
-            child_pid,
+            // The pid now comes from io_kind, which also decides whether there is
+            // a local pid at all.
+            child_pid: _,
             rows,
             cols,
             cell_width_px,
@@ -1930,7 +2031,13 @@ impl PaneRuntime {
             pane_terminal.seed_history_ansi(ansi);
         }
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
-        let child_pid = LocalPid::known(child_pid);
+        // A remote pane has no local pid. Detection and cwd probes therefore see
+        // the zero sentinel and degrade, instead of reading a pid that belongs to
+        // another machine's namespace.
+        let child_pid = match &io_kind {
+            ImportedIo::LocalHandoff { child_pid } => LocalPid::known(*child_pid),
+            ImportedIo::Remote { .. } => LocalPid::pending(),
+        };
         let reported_cwd = Arc::new(Mutex::new(None));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
@@ -1985,13 +2092,23 @@ impl PaneRuntime {
                 let _ = rt.block_on(exit_events.send(AppEvent::PaneDied { pane_id }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
-            PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
+            let actor = PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),
                 master_fd,
-                initially_quiesced: true,
+                // A handoff import resumes a paused stream; a fresh remote spawn
+                // should start reading straight away.
+                initially_quiesced: matches!(io_kind, ImportedIo::LocalHandoff { .. }),
                 on_read,
                 on_reader_exit: Some(on_reader_exit),
-            })?)
+            })?;
+            match &io_kind {
+                ImportedIo::LocalHandoff { .. } => PaneRuntimeIo::Actor(actor),
+                ImportedIo::Remote { link, channel } => PaneRuntimeIo::Remote {
+                    actor,
+                    link: std::sync::Arc::clone(link),
+                    channel: *channel,
+                },
+            }
         };
 
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
@@ -2009,7 +2126,10 @@ impl PaneRuntime {
             terminal,
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
-            local_pid: Some(child_pid),
+            local_pid: match &io_kind {
+                ImportedIo::LocalHandoff { .. } => Some(child_pid),
+                ImportedIo::Remote { .. } => None,
+            },
             reported_cwd,
             child_wait_completed: None,
             kitty_keyboard_flags,
@@ -4398,5 +4518,167 @@ mod tests {
                 observed_at: _,
             } if delivered_pane == pane_id
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod remote_pane_tests {
+    use super::*;
+
+    /// Path to the built herdr binary, which doubles as the pty-host.
+    fn herdr_binary() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().expect("test exe");
+        path.pop();
+        if path.ends_with("deps") {
+            path.pop();
+        }
+        path.join("herdr")
+    }
+
+    /// A PaneRuntime whose process runs under a real pty-host subprocess.
+    ///
+    /// Exercises the whole chain the way production will: daemon owns the PTY, the
+    /// link turns it into a socket, and the ordinary actor drives that socket.
+    async fn remote_pane(
+        argv: &[&str],
+    ) -> Option<(PaneRuntime, mpsc::Receiver<AppEvent>, std::process::Child)> {
+        let binary = herdr_binary();
+        if !binary.exists() {
+            // Unit tests can run before the binary is linked; skip rather than
+            // fail, since the integration tests cover this path too.
+            return None;
+        }
+
+        let mut child = std::process::Command::new(binary)
+            .arg("pty-host")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn pty-host");
+        let stdout = child.stdout.take().expect("stdout");
+        let stdin = child.stdin.take().expect("stdin");
+
+        let link = std::sync::Arc::new(
+            crate::host::link::HostLink::connect(stdout, Box::new(stdin)).expect("handshake"),
+        );
+        let (channel, fd) = link
+            .open_channel(crate::host::protocol::SpawnSpec {
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            })
+            .expect("open channel");
+
+        let (events_tx, events_rx) = mpsc::channel(64);
+        let runtime = PaneRuntime::spawn_remote(
+            PaneId::from_raw(1),
+            link,
+            channel,
+            fd,
+            24,
+            80,
+            8,
+            16,
+            64 * 1024,
+            crate::terminal_theme::TerminalTheme::default(),
+            events_tx,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("spawn_remote");
+
+        Some((runtime, events_rx, child))
+    }
+
+    #[tokio::test]
+    async fn a_remote_pane_receives_its_output() {
+        let Some((runtime, _events, mut child)) =
+            remote_pane(&["sh", "-c", "echo remote-marker; sleep 5"]).await
+        else {
+            return;
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            seen = runtime.visible_text();
+            if seen.contains("remote-marker") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = child.kill();
+        assert!(
+            seen.contains("remote-marker"),
+            "remote output should reach the pane's terminal: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_pane_has_no_local_pid() {
+        // The pid lives on the other machine. Exposing one here would let local
+        // signal and /proc paths act on an unrelated local process.
+        let Some((runtime, _events, mut child)) = remote_pane(&["sh", "-c", "sleep 5"]).await
+        else {
+            return;
+        };
+        assert_eq!(runtime.child_pid(), None);
+        let _ = child.kill();
+    }
+
+    #[tokio::test]
+    async fn a_remote_pane_reports_death_when_its_process_exits() {
+        // EOF on the channel socket must surface as PaneDied, the same signal a
+        // local child's exit produces, or a finished remote pane would linger.
+        let Some((runtime, mut events, mut child)) =
+            remote_pane(&["sh", "-c", "echo bye; exit 0"]).await
+        else {
+            return;
+        };
+
+        let died = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, AppEvent::PaneDied { .. }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+
+        let _ = child.kill();
+        drop(runtime);
+        assert_eq!(died.ok(), Some(true), "expected PaneDied for a remote pane");
+    }
+
+    #[tokio::test]
+    async fn resizing_a_remote_pane_reaches_the_remote_process() {
+        // Proves resize took the message path rather than the local ioctl, by
+        // asking the remote process what size it sees.
+        let Some((runtime, _events, mut child)) =
+            remote_pane(&["sh", "-c", "sleep 0.5; stty size; sleep 30"]).await
+        else {
+            return;
+        };
+
+        runtime.resize(37, 141, 8, 16);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = String::new();
+        while std::time::Instant::now() < deadline {
+            seen = runtime.visible_text();
+            if seen.contains("37 141") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = child.kill();
+        assert!(
+            seen.contains("37 141"),
+            "remote process should observe the new size: {seen:?}"
+        );
     }
 }

@@ -9,6 +9,13 @@ use crate::host::sources;
 pub(super) fn run_host_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
         Some("list") => host_list(&args[1..]),
+        #[cfg(unix)]
+        Some("probe") => host_probe(&args[1..]),
+        #[cfg(windows)]
+        Some("probe") => {
+            eprintln!("herdr host probe is not supported on Windows yet");
+            Ok(2)
+        }
         Some("help") | Some("--help") | Some("-h") => {
             print_host_help();
             Ok(0)
@@ -112,7 +119,85 @@ fn origin_label(origin: crate::host::discovery::HostOrigin) -> &'static str {
 fn print_host_help() {
     println!("herdr host commands:");
     println!("  herdr host list [--json]");
+    println!("  herdr host probe <host>");
     println!();
     println!("DIALABLE means ssh knows how to reach the name — a literal Host stanza, or a");
     println!("discovered name that ssh -G resolves. It does not mean the machine is up.");
+}
+
+/// Verify a host end to end: connect over ssh, run a command there, read its
+/// output back. Confirms the whole path a remote pane depends on, which is worth
+/// more than a reachability check.
+///
+/// Unix-only for the same reason as the link and the daemon: it hands out a
+/// socket fd.
+#[cfg(unix)]
+fn host_probe(args: &[String]) -> std::io::Result<i32> {
+    let Some(name) = args.first() else {
+        eprintln!("usage: herdr host probe <host>");
+        return Ok(2);
+    };
+    let Some(host) = crate::host::HostId::parse(name) else {
+        eprintln!("invalid host name `{name}`");
+        return Ok(2);
+    };
+
+    let (link, mut child) = match crate::host::link::HostLink::connect_over_ssh(host.as_str()) {
+        Ok(connected) => connected,
+        Err(err) => {
+            eprintln!("{err}");
+            return Ok(1);
+        }
+    };
+    println!(
+        "connected to {host} (host protocol {})",
+        link.peer_version()
+    );
+
+    const MARKER: &str = "herdr-probe-ok";
+    let (_channel, fd) = match link.open_channel(crate::host::protocol::SpawnSpec {
+        argv: vec!["sh".into(), "-c".into(), format!("echo {MARKER}")],
+        cwd: None,
+        env: Vec::new(),
+        rows: 24,
+        cols: 80,
+    }) {
+        Ok(opened) => opened,
+        Err(err) => {
+            eprintln!("could not start a process on {host}: {err}");
+            let _ = child.kill();
+            return Ok(1);
+        }
+    };
+
+    let mut stream = std::os::unix::net::UnixStream::from(fd);
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+
+    let mut seen = String::new();
+    let mut buffer = [0u8; 4096];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        use std::io::Read;
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                if seen.contains(MARKER) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if seen.contains(MARKER) {
+        println!("ran a command on {host} and read its output back");
+        Ok(0)
+    } else {
+        eprintln!("connected to {host} but never saw the probe output");
+        Ok(1)
+    }
 }
