@@ -507,6 +507,139 @@ fn all_agent_statuses() -> Vec<crate::api::schema::AgentStatus> {
     ]
 }
 
+/// Statuses that count as wanting attention when the caller does not say.
+///
+/// Just `Blocked`, deliberately narrower than `agent.wait`'s default. This call exists
+/// to answer "does anything need me right now", and a finished agent does not: it is
+/// news, not a demand. Defaulting to include it would make the common invocation fire
+/// constantly in a fleet where something finishes every few minutes, and a wait that
+/// always returns immediately is worse than no wait at all.
+fn attention_wait_statuses(
+    until: Vec<crate::api::schema::AgentStatus>,
+) -> Vec<crate::api::schema::AgentStatus> {
+    if until.is_empty() {
+        vec![crate::api::schema::AgentStatus::Blocked]
+    } else {
+        until
+    }
+}
+
+/// Whether one agent satisfies an attention wait.
+///
+/// Pure, so the matching rules can be tested without a server. `launch_pending` agents
+/// are excluded: an agent that has not started yet can report a status that is about
+/// its absence rather than about anything a person could act on.
+pub(crate) fn attention_match(
+    agent: &crate::api::schema::AgentInfo,
+    until: &[crate::api::schema::AgentStatus],
+    host: Option<&str>,
+) -> bool {
+    if agent.launch_pending {
+        return false;
+    }
+    if let Some(host) = host {
+        // Absent means local, which no host filter should match: asking for a machine
+        // by name and being handed a local pane would be actively misleading.
+        if agent.host.as_deref() != Some(host) {
+            return false;
+        }
+    }
+    until.contains(&agent.agent_status)
+}
+
+/// Block until `count` agents want attention, on any machine or one named machine.
+pub(super) fn wait_for_attention(
+    request_id: String,
+    params: crate::api::schema::AttentionWaitParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    _event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    let until = attention_wait_statuses(params.until);
+    let host = params.host.clone();
+    // Zero would match before anything happened, which is never what a caller means.
+    let want = params.count.unwrap_or(1).max(1);
+    let deadline = params
+        .timeout_ms
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+
+    loop {
+        match attention_matches(&request_id, &until, host.as_deref(), api_tx) {
+            Ok(matched) if matched.len() >= want => {
+                return serde_json::to_string(&SuccessResponse {
+                    id: request_id,
+                    result: ResponseResult::AttentionMatched { agents: matched },
+                })
+                .map(Some)
+                .map_err(std::io::Error::other);
+            }
+            Ok(_) => {}
+            Err(response) => {
+                return serde_json::to_string(&response)
+                    .map(Some)
+                    .map_err(std::io::Error::other);
+            }
+        }
+
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return serde_json::to_string(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    code: "timeout".into(),
+                    message: "timed out waiting for an agent to want attention".into(),
+                },
+            })
+            .map(Some)
+            .map_err(std::io::Error::other);
+        }
+
+        // The client going away has to end this: a fleet-wide wait is the call most
+        // likely to be left running for hours, so a leaked poll loop per abandoned
+        // client would accumulate where it is least visible.
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+fn attention_matches(
+    request_id: &str,
+    until: &[crate::api::schema::AgentStatus],
+    host: Option<&str>,
+    api_tx: &ApiRequestSender,
+) -> Result<Vec<crate::api::schema::AgentInfo>, ErrorResponse> {
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:agents"),
+            method: Method::AgentList(crate::api::schema::EmptyParams {}),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: "could not read the agent list".into(),
+        },
+    })?;
+    let agents = value
+        .get("result")
+        .and_then(|result| result.get("agents"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let agents: Vec<crate::api::schema::AgentInfo> =
+        serde_json::from_value(agents).unwrap_or_default();
+
+    Ok(agents
+        .into_iter()
+        .filter(|agent| attention_match(agent, until, host))
+        .collect())
+}
+
 fn agent_wait_statuses(
     until: Vec<crate::api::schema::AgentStatus>,
 ) -> Vec<crate::api::schema::AgentStatus> {
@@ -776,6 +909,145 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
         },
     })
     .unwrap()
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::attention_match;
+    use crate::api::schema::{AgentInfo, AgentStatus};
+
+    fn agent(status: AgentStatus, host: Option<&str>) -> AgentInfo {
+        AgentInfo {
+            terminal_id: "t1".into(),
+            host: host.map(str::to_string),
+            message: None,
+            name: None,
+            agent: None,
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: status,
+            screen_detection_skipped: false,
+            state_labels: Default::default(),
+            tokens: Default::default(),
+            agent_session: None,
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: "w1:p1".into(),
+            focused: false,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq: 0,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn the_default_is_blocked_alone() {
+        // A product decision, pinned directly because it is not observable end to end:
+        // a session with no agents times out whatever the default set is, so widening
+        // it silently breaks nothing until a real fleet is attached and the call starts
+        // returning instantly. `Idle` and `Unknown` are the dangerous ones — most agents
+        // are in one of them most of the time.
+        assert_eq!(
+            super::attention_wait_statuses(Vec::new()),
+            vec![AgentStatus::Blocked]
+        );
+        // An explicit request is honoured exactly, never widened.
+        assert_eq!(
+            super::attention_wait_statuses(vec![AgentStatus::Done]),
+            vec![AgentStatus::Done]
+        );
+    }
+
+    #[test]
+    fn only_the_requested_statuses_wake_a_wait() {
+        let until = [AgentStatus::Blocked];
+        assert!(attention_match(
+            &agent(AgentStatus::Blocked, None),
+            &until,
+            None
+        ));
+        for status in [
+            AgentStatus::Working,
+            AgentStatus::Idle,
+            AgentStatus::Done,
+            AgentStatus::Unknown,
+        ] {
+            assert!(
+                !attention_match(&agent(status, None), &until, None),
+                "{status:?} should not wake a wait for blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_filter_excludes_other_hosts_and_local_panes() {
+        let until = [AgentStatus::Blocked];
+        assert!(attention_match(
+            &agent(AgentStatus::Blocked, Some("box1")),
+            &until,
+            Some("box1")
+        ));
+        assert!(!attention_match(
+            &agent(AgentStatus::Blocked, Some("box2")),
+            &until,
+            Some("box1")
+        ));
+        // A local pane has no host. Asking for a machine by name and being handed a
+        // local pane would be actively misleading — the caller is about to act on
+        // something they believe is elsewhere.
+        assert!(!attention_match(
+            &agent(AgentStatus::Blocked, None),
+            &until,
+            Some("box1")
+        ));
+    }
+
+    #[test]
+    fn no_host_filter_spans_every_machine_including_local() {
+        // The whole reason this call exists: one wait covering the fleet.
+        let until = [AgentStatus::Blocked];
+        for host in [None, Some("box1"), Some("box2")] {
+            assert!(attention_match(
+                &agent(AgentStatus::Blocked, host),
+                &until,
+                None
+            ));
+        }
+    }
+
+    #[test]
+    fn an_agent_that_has_not_launched_yet_does_not_count() {
+        // Its status describes its absence, not anything a person could act on, so
+        // waking someone for it wastes the one thing this is meant to protect.
+        let mut pending = agent(AgentStatus::Blocked, None);
+        pending.launch_pending = true;
+        assert!(!attention_match(&pending, &[AgentStatus::Blocked], None));
+    }
+
+    #[test]
+    fn several_statuses_can_be_requested_at_once() {
+        let until = [AgentStatus::Blocked, AgentStatus::Done];
+        assert!(attention_match(
+            &agent(AgentStatus::Blocked, None),
+            &until,
+            None
+        ));
+        assert!(attention_match(
+            &agent(AgentStatus::Done, None),
+            &until,
+            None
+        ));
+        assert!(!attention_match(
+            &agent(AgentStatus::Working, None),
+            &until,
+            None
+        ));
+    }
 }
 
 #[cfg(test)]

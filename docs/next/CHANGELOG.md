@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- `herdr attention wait` blocks until any agent on any machine wants attention, with `--status`, `--host`, and `--count`. `agent wait` takes a single target, so asking "tell me when anything needs me" previously required knowing which agent to watch.
+
 ### Changed
 - Relicensed Herdr from AGPL-3.0-or-later to Apache-2.0.
 

@@ -31,6 +31,32 @@ pub struct AgentWaitParams {
     pub timeout_ms: Option<u64>,
 }
 
+/// Wait until some agent *anywhere* wants attention.
+///
+/// `agent.wait` takes exactly one target, so the question a person with twenty agents
+/// on five machines actually has — "tell me when any of them needs me" — cannot be
+/// asked. Watching them one at a time is not equivalent: you would have to know which
+/// one to watch, which is the thing you are trying to find out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AttentionWaitParams {
+    /// Statuses that count as wanting attention. Empty means `blocked` alone —
+    /// something has stopped and cannot continue without a person, which is the only
+    /// state that is unambiguously a demand rather than a notification.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub until: Vec<AgentStatus>,
+    /// Restrict to one machine. Absent means every machine, which is the point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Return once this many agents match at the same time. Defaults to 1.
+    ///
+    /// Useful for batching: waiting for three before walking over rather than being
+    /// interrupted three times.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentPromptWaitOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

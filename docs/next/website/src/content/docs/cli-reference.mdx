@@ -350,6 +350,31 @@ Use `pane wait-output` for normal commands and servers. Use `agent wait` for cod
 
 `pane wait-output`, `agent wait`, and `agent prompt --wait` wait indefinitely when `--timeout` is omitted. A timeout or server error is emitted as JSON on stderr with exit status 1. CLI usage errors exit with status 2.
 
+## Fleet attention
+
+Wait until some agent anywhere wants attention:
+
+```bash
+herdr attention wait [--status STATUS]... [--host HOST] [--count N] [--timeout MS]
+```
+
+`agent wait` takes one target, so it cannot answer "tell me when any of them needs
+me" — you would have to already know which agent to watch, which is the thing you are
+trying to find out. `attention wait` watches every agent on every machine at once and
+returns the ones that matched.
+
+The default is `blocked` alone, deliberately narrower than `agent wait`. A finished
+agent is news rather than a demand, and including it would make the common invocation
+return almost immediately in a fleet where something finishes every few minutes. Pass
+`--status done` when that is what you want.
+
+`--host` restricts the wait to one machine. Agents in local workspaces have no host
+and are never matched by a `--host` filter. `--count N` returns only once N agents
+match at the same time, which is useful for being interrupted once instead of N times.
+
+Without `--timeout` it waits indefinitely. A timeout is emitted as JSON on stderr with
+exit status 1; CLI usage errors exit with status 2.
+
 ## Integrations
 
 ```bash

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 18,
+  "protocol": 19,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -1679,6 +1679,43 @@
           "required": [
             "target"
           ],
+          "type": "object"
+        },
+        "AttentionWaitParams": {
+          "description": "Wait until some agent *anywhere* wants attention.\n\n`agent.wait` takes exactly one target, so the question a person with twenty agents\non five machines actually has — \"tell me when any of them needs me\" — cannot be\nasked. Watching them one at a time is not equivalent: you would have to know which\none to watch, which is the thing you are trying to find out.",
+          "properties": {
+            "count": {
+              "description": "Return once this many agents match at the same time. Defaults to 1.\n\nUseful for batching: waiting for three before walking over rather than being\ninterrupted three times.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "host": {
+              "description": "Restrict to one machine. Absent means every machine, which is the point.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "until": {
+              "description": "Statuses that count as wanting attention. Empty means `blocked` alone —\nsomething has stopped and cannot continue without a person, which is the only\nstate that is unambiguously a demand rather than a notification.",
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
+            }
+          },
           "type": "object"
         },
         "ClientWindowTitleSetParams": {
@@ -4996,6 +5033,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentWaitParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "attention.wait",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AttentionWaitParams"
             }
           },
           "required": [
@@ -8813,6 +8866,26 @@
               "required": [
                 "type",
                 "agent"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Agents that wanted attention when a fleet-wide wait returned. Plural because\nthe caller may have asked to be woken only once several do, and re-listing to\nfind out which is both racy and needless.",
+              "properties": {
+                "agents": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "attention_matched",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "agents"
               ],
               "type": "object"
             },

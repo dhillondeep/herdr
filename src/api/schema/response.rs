@@ -104,6 +104,12 @@ pub enum ResponseResult {
     AgentPrompted {
         agent: AgentInfo,
     },
+    /// Agents that wanted attention when a fleet-wide wait returned. Plural because
+    /// the caller may have asked to be woken only once several do, and re-listing to
+    /// find out which is both racy and needless.
+    AttentionMatched {
+        agents: Vec<AgentInfo>,
+    },
     AgentList {
         agents: Vec<AgentInfo>,
     },

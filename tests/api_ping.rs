@@ -304,7 +304,57 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 18);
+    assert_eq!(value["result"]["protocol"], 19);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn attention_wait_spans_the_fleet_and_times_out_when_nothing_wants_anything() {
+    // End-to-end because the interesting part is the routing: `attention.wait` is
+    // handled in the api server's connection thread rather than by the app, and a
+    // method wired only into the app would answer "handled by the api server" forever.
+    //
+    // A fresh session has no blocked agent, so the timeout branch is what a correct
+    // implementation must reach. Returning success here would mean the call fires
+    // immediately and is useless for its one purpose.
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let started = Instant::now();
+    let value = send_request(
+        &socket_path,
+        r#"{"id":"req_att","method":"attention.wait","params":{"timeout_ms":1200}}"#,
+    );
+    let elapsed = started.elapsed();
+
+    assert_eq!(value["id"], "req_att");
+    assert_eq!(
+        value["error"]["code"], "timeout",
+        "expected a timeout, got {value}"
+    );
+    // It must actually have waited. An implementation that returned the timeout
+    // straight away would satisfy the assertion above while being useless.
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "returned after only {elapsed:?}, so it did not wait"
+    );
+
+    // A host filter must not turn into an error or a match on local panes.
+    let filtered = send_request(
+        &socket_path,
+        r#"{"id":"req_att2","method":"attention.wait","params":{"host":"no-such-host","timeout_ms":600}}"#,
+    );
+    assert_eq!(
+        filtered["error"]["code"], "timeout",
+        "expected a timeout, got {filtered}"
+    );
 
     cleanup_spawned_herdr(child, base);
 }
