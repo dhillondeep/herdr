@@ -85,6 +85,143 @@ struct OutputLog {
     /// `None` when a shadow could not be created. Losing the snapshot degrades a
     /// reattach to `Desync`; failing the spawn would lose the pane.
     screen: Option<crate::ghostty::Terminal>,
+    /// Bytes that fell out of the memory ring, kept on disk so a longer absence can
+    /// still be replayed exactly instead of resolving to a snapshot.
+    ///
+    /// `None` when spooling is off or has failed. Losing it is always survivable: the
+    /// client gets a `Desync` or a snapshot, which is what it would have got anyway.
+    spool: Option<Spool>,
+}
+
+/// The part of a channel's output that no longer fits in memory.
+///
+/// Append-only, and read back only when a client reattaches far behind. Deliberately
+/// simple: it exists to widen the replay window, and a design that could corrupt the
+/// window would be worse than not having one.
+struct Spool {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    /// Offset of the first byte in the file.
+    start: u64,
+    /// Bytes currently in the file.
+    len: u64,
+    /// Cap. Past this the file is discarded whole and starts again — see `append`.
+    capacity: u64,
+}
+
+impl Spool {
+    /// Write bytes that have just aged out of the ring.
+    ///
+    /// Returns whether the spool is still usable. Any write failure gives up on
+    /// spooling for this channel rather than propagating: the log's job is to keep the
+    /// pane's output flowing, and a full disk must not take an agent down.
+    fn append(&mut self, bytes: &[u8]) -> bool {
+        use std::io::Write;
+
+        // Over the cap the whole file is dropped and started again, rather than
+        // rewritten to drop a prefix. Rewriting means copying the remainder on every
+        // overflow, which on a busy pane is continuous IO on a machine herdr does not
+        // own. The cost is that the replay window collapses at once instead of sliding
+        // — and a client that lands in that gap gets a snapshot, which is exactly what
+        // it would have got with no spool at all.
+        if self.len.saturating_add(bytes.len() as u64) > self.capacity {
+            if self.file.set_len(0).is_err() {
+                return false;
+            }
+            if std::io::Seek::seek(&mut self.file, std::io::SeekFrom::Start(0)).is_err() {
+                return false;
+            }
+            self.start = self.start.saturating_add(self.len);
+            self.len = 0;
+        }
+        if self.file.write_all(bytes).is_err() {
+            return false;
+        }
+        self.len += bytes.len() as u64;
+        true
+    }
+
+    /// Bytes from `offset` to the end of the spool, or `None` if it does not hold them.
+    fn since(&self, offset: u64) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if offset < self.start || offset > self.start + self.len {
+            return None;
+        }
+        let skip = offset - self.start;
+        let mut file = self.file.try_clone().ok()?;
+        file.seek(SeekFrom::Start(skip)).ok()?;
+        let mut out = Vec::with_capacity((self.len - skip) as usize);
+        file.take(self.len - skip).read_to_end(&mut out).ok()?;
+        Some(out)
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        // Raw PTY output is whatever the agent printed, which routinely includes
+        // things nobody wants left on disk. It lives exactly as long as the channel.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// How much of each channel's output may be kept on disk.
+///
+/// Zero disables spooling entirely, which is the right answer for anyone who would
+/// rather not have terminal output written to a host's filesystem at all.
+fn spool_capacity() -> u64 {
+    std::env::var("HERDR_PTY_HOST_SPOOL_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(32 * 1024 * 1024)
+}
+
+/// Where spool files live.
+///
+/// Deliberately NOT `XDG_RUNTIME_DIR`. On a container that is tmpfs, which is charged
+/// to the cgroup memory limit — so a spool meant to protect against losing output would
+/// instead get the workspace OOM-killed, destroying the very agents it exists for.
+/// `~/.cache` is on the persistent volume on the workspaces this is built for.
+fn spool_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".cache/herdr/spool"))
+}
+
+/// Create a spool file for one channel, or `None` if spooling is unavailable.
+fn open_spool(channel: ChannelId) -> Option<Spool> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let capacity = spool_capacity();
+    if capacity == 0 {
+        return None;
+    }
+    let dir = spool_dir()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+
+    // Per process as well as per channel: two daemons must not share a file, and a
+    // stale file from a previous daemon must not be read as this one's history.
+    let path = dir.join(format!("{}-{channel}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        // 0600: the contents are whatever the agent printed.
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+
+    Some(Spool {
+        file,
+        path,
+        start: 0,
+        len: 0,
+        capacity,
+    })
 }
 
 impl OutputLog {
@@ -98,6 +235,7 @@ impl OutputLog {
             // it from its first byte.
             ready: true,
             screen: None,
+            spool: None,
         }
     }
 
@@ -107,11 +245,12 @@ impl OutputLog {
     /// only to answer "what is on the screen right now" for a client too far behind
     /// to replay. Keeping scrollback here would duplicate the client's, on a machine
     /// herdr does not own, for no gain.
-    fn with_screen(capacity: usize, cols: u16, rows: u16) -> Self {
+    fn with_screen(capacity: usize, cols: u16, rows: u16, channel: ChannelId) -> Self {
         let mut log = Self::new(capacity);
         log.screen = crate::ghostty::Terminal::new(cols, rows, 0)
             .inspect_err(|err| tracing::warn!(err = ?err, "no screen shadow; reattach will desync"))
             .ok();
+        log.spool = open_spool(channel);
         log
     }
 
@@ -133,10 +272,20 @@ impl OutputLog {
         self.buffer.extend(bytes.iter().copied());
         self.end += bytes.len() as u64;
         // Trim from the front, advancing `start` by exactly what was dropped so the
-        // offset arithmetic stays exact.
+        // offset arithmetic stays exact. What is dropped goes to the spool first, if
+        // there is one, so it is aged out of memory rather than lost.
         while self.buffer.len() > self.capacity {
             let excess = self.buffer.len() - self.capacity;
-            self.buffer.drain(..excess);
+            let evicted: Vec<u8> = self.buffer.drain(..excess).collect();
+            if let Some(spool) = self.spool.as_mut() {
+                // A spool that cannot be written is dropped entirely rather than left
+                // half-written: a file with a hole in it would replay a hole, and a
+                // hole fed to a VT parser is permanent corruption rather than a gap.
+                if !spool.append(&evicted) {
+                    tracing::warn!("output spool failed; replay window is memory only");
+                    self.spool = None;
+                }
+            }
             self.start += excess as u64;
         }
     }
@@ -153,7 +302,14 @@ impl OutputLog {
             return None;
         }
         if offset < self.start {
-            return None;
+            // Older than memory holds. The spool may still have it, in which case the
+            // answer is the spooled tail followed by everything in the ring — the two
+            // are contiguous by construction, since the spool is written from exactly
+            // what the ring evicts.
+            let spool = self.spool.as_ref()?;
+            let mut out = spool.since(offset)?;
+            out.extend(self.buffer.iter().copied());
+            return Some(out);
         }
         let skip = (offset - self.start) as usize;
         Some(self.buffer.iter().skip(skip).copied().collect())
@@ -565,6 +721,7 @@ fn spawn_channel(
         OUTPUT_LOG_CAPACITY,
         spec.cols,
         spec.rows,
+        channel,
     )));
 
     channels.lock().map_err(|_| poisoned())?.insert(
@@ -1012,6 +1169,102 @@ mod output_log_tests {
         log.append(&chunk);
         produced.extend_from_slice(&chunk);
         (from, len)
+    }
+
+    /// A log whose spool is a real file in a scratch directory.
+    fn log_with_spool(capacity: usize, spool_capacity: u64, tag: &str) -> OutputLog {
+        let dir =
+            std::env::temp_dir().join(format!("herdr-spool-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("spool");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("spool file");
+        let mut log = OutputLog::new(capacity);
+        log.spool = Some(Spool {
+            file,
+            path,
+            start: 0,
+            len: 0,
+            capacity: spool_capacity,
+        });
+        log
+    }
+
+    #[test]
+    fn spooled_bytes_extend_the_replay_window_without_a_seam() {
+        // The point of the spool: an absence longer than memory still replays exactly.
+        // The seam between file and ring is where this would go wrong, so the check is
+        // byte-for-byte across it rather than merely "something came back".
+        let mut log = log_with_spool(8, 1024, "seam");
+        let produced: Vec<u8> = (0..64u8).collect();
+        for chunk in produced.chunks(5) {
+            log.append(chunk);
+        }
+
+        // Everything is still replayable even though memory holds only the last 8.
+        assert!(
+            log.start > 0,
+            "the ring must have evicted for this to mean anything"
+        );
+        let replayed = log.since(0).expect("spool should cover the whole stream");
+        assert_eq!(
+            replayed, produced,
+            "replay must match byte for byte across the seam"
+        );
+
+        // And from an offset that lands inside the spooled part.
+        let from_ten = log.since(10).expect("mid-spool offset");
+        assert_eq!(
+            from_ten,
+            produced[10..],
+            "a mid-spool offset must line up exactly"
+        );
+    }
+
+    #[test]
+    fn an_offset_older_than_the_spool_is_still_unresumable() {
+        // Widening the window does not remove its edge. Past the spool the answer must
+        // still be "resync", never a partial stream — a hole is worse than a snapshot.
+        let mut log = log_with_spool(4, 16, "edge");
+        for chunk in (0..64u8).collect::<Vec<_>>().chunks(8) {
+            log.append(chunk);
+        }
+        assert_eq!(log.since(0), None, "beyond the spool must be unresumable");
+    }
+
+    #[test]
+    fn the_spool_file_does_not_outlive_the_channel() {
+        // Raw PTY output is whatever the agent printed — tokens it echoed, contents of
+        // files it opened. Leaving that on a host's disk after the pane is gone turns a
+        // replay buffer into a durable copy of everything, on a machine herdr does not
+        // own.
+        let path;
+        {
+            let log = log_with_spool(4, 64, "cleanup");
+            path = log.spool.as_ref().expect("spool").path.clone();
+            assert!(
+                path.exists(),
+                "the file should exist while the channel does"
+            );
+        }
+        assert!(
+            !path.exists(),
+            "the spool file must be removed with the channel"
+        );
+    }
+
+    #[test]
+    fn a_log_with_no_spool_behaves_exactly_as_before() {
+        // Spooling is optional, and turning it off must not change the contract.
+        let mut log = OutputLog::new(4);
+        log.append(b"abcdefgh");
+        assert_eq!(log.since(0), None);
+        assert_eq!(log.since(4), Some(b"efgh".to_vec()));
     }
 
     #[test]

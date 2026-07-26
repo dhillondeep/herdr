@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Remote panes keep output that no longer fits in memory in a per-channel disk spool, so a reconnect after a longer absence replays exactly instead of falling back to a screen snapshot. 32 MiB per pane by default; set `HERDR_PTY_HOST_SPOOL_BYTES=0` to keep terminal output off the host's disk entirely.
 - Remote workspaces now report their git branch and ahead/behind counts, read on the machine the repository is actually on. Previously they reported nothing, because running git locally for a remote workspace describes a different repository whenever the path happens to exist here too.
 - Agent detection can mark a screen as a *fault* — a usage limit, quota, or expired credential the agent cannot get past on its own. A faulted agent is never announced as finished, which previously turned a rate-limited agent into a cheerful "done" notification. No bundled manifest sets it yet; the rules need captured evidence.
 - Panes whose remote host restarted are kept and marked `host_stopped` instead of being closed, so the last screen and the reason survive.
