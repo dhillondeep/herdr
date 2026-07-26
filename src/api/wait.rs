@@ -615,6 +615,31 @@ pub(super) fn wait_for_attention(
     }
 }
 
+/// Rank an agent for ordering. Unclassifiable ones sort last rather than being dropped:
+/// the caller asked for these statuses explicitly, so they belong in the answer even
+/// when they are not a demand in their own right.
+fn agent_demand_class(agent: &crate::api::schema::AgentInfo) -> (u8, u8) {
+    use crate::api::schema::{AgentStatus, BlockerKind};
+    let state = match agent.agent_status {
+        AgentStatus::Blocked => crate::detect::AgentState::Blocked,
+        AgentStatus::Working => crate::detect::AgentState::Working,
+        AgentStatus::Idle | AgentStatus::Done => crate::detect::AgentState::Idle,
+        AgentStatus::Unknown => crate::detect::AgentState::Unknown,
+    };
+    let blocker = match agent.blocker {
+        Some(BlockerKind::Permission) => crate::detect::BlockerKind::Permission,
+        Some(BlockerKind::Question) => crate::detect::BlockerKind::Question,
+        Some(BlockerKind::Selection) => crate::detect::BlockerKind::Selection,
+        Some(BlockerKind::Unknown) | None => crate::detect::BlockerKind::Unknown,
+    };
+    // `seen` is not carried on AgentInfo; a finished agent surfaced by a wait is by
+    // definition one the caller has not looked at yet.
+    match crate::attention::demand_class(state, blocker, false, agent.host_stopped) {
+        Some(class) => (0, class as u8),
+        None => (1, 0),
+    }
+}
+
 fn attention_matches(
     request_id: &str,
     until: &[crate::api::schema::AgentStatus],
@@ -645,10 +670,21 @@ fn attention_matches(
     let agents: Vec<crate::api::schema::AgentInfo> =
         serde_json::from_value(agents).unwrap_or_default();
 
-    Ok(agents
+    let mut matched: Vec<crate::api::schema::AgentInfo> = agents
         .into_iter()
         .filter(|agent| attention_match(agent, until, host, blocker))
-        .collect())
+        .collect();
+    // Most urgent first, and cheap-to-clear before expensive within that. Returning
+    // them in whatever order the agent list happened to be in would leave the caller
+    // to re-derive a ranking that herdr already knows.
+    matched.sort_by_key(|agent| {
+        (
+            agent_demand_class(agent),
+            // Stable within a class, so repeated calls do not shuffle.
+            agent.terminal_id.clone(),
+        )
+    });
+    Ok(matched)
 }
 
 fn agent_wait_statuses(

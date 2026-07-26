@@ -733,6 +733,7 @@ impl App {
             workspace_press: None,
             tab_press: None,
             selection: None,
+            attention_cursor: None,
             selection_autoscroll: None,
             context_menu: None,
             update_available,

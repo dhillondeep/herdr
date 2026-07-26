@@ -8,7 +8,65 @@
 //!
 //! Pure and free of PTY or app state, so the ordering can be tested directly.
 
-use crate::detect::AgentState;
+use crate::detect::{AgentState, BlockerKind};
+
+/// How expensive the attention an agent wants is, ranked.
+///
+/// The flat priority answers "who is waiting"; this answers "what will it cost me",
+/// which is the question that matters once the list is long. A permission prompt is a
+/// two-second keystroke and an open question is a two-minute think, so ranking them
+/// together makes a queue of twenty blocked agents impossible to work down
+/// efficiently — you cannot tell which five you could clear on the way to lunch.
+///
+/// Ordered most urgent first, via `Ord` on the declaration order.
+///
+/// `Working` has no class on purpose: it is not waiting for anybody, and putting it in
+/// a queue of things that want a person would bury the ones that do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DemandClass {
+    /// The agent cannot continue for a reason a person must resolve elsewhere — a
+    /// usage limit, a dead host. Ranked first because nothing else recovers on its
+    /// own, and unlike a prompt it is not even visible unless something says so.
+    Fault,
+    /// Blocked on approving or denying something. Cheap to clear, so it comes before
+    /// the expensive kinds: clearing it unblocks work immediately.
+    BlockedDecision,
+    /// Blocked on a question or a choice that needs thought.
+    BlockedQuestion,
+    /// Blocked, but the rule did not say how. Ranked after the known kinds rather than
+    /// guessed into one of them.
+    BlockedUnknown,
+    /// Finished and not yet looked at. A result nobody has seen is the thing most
+    /// likely to be forgotten, but it is news rather than a demand.
+    Done,
+}
+
+/// Classify what an agent wants, or `None` if it wants nothing.
+///
+/// `host_stopped` outranks the agent's last known state: a pane whose machine went away
+/// may well have been `Idle` when the link died, and reporting that would present lost
+/// work as finished work.
+pub fn demand_class(
+    state: AgentState,
+    blocker: BlockerKind,
+    seen: bool,
+    host_stopped: bool,
+) -> Option<DemandClass> {
+    if host_stopped {
+        return Some(DemandClass::Fault);
+    }
+    match state {
+        AgentState::Blocked => Some(match blocker {
+            BlockerKind::Permission => DemandClass::BlockedDecision,
+            BlockerKind::Question | BlockerKind::Selection => DemandClass::BlockedQuestion,
+            BlockerKind::Unknown => DemandClass::BlockedUnknown,
+        }),
+        // Only unseen: once it has been looked at, a finished agent is capacity rather
+        // than something owed.
+        AgentState::Idle if !seen => Some(DemandClass::Done),
+        AgentState::Idle | AgentState::Working | AgentState::Unknown => None,
+    }
+}
 
 /// Rank a pane's state by how much attention it wants. Higher wants more.
 ///
@@ -31,6 +89,71 @@ pub fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
         (AgentState::Working, _) => 2,
         (AgentState::Idle, true) => 1,
         (AgentState::Unknown, _) => 0,
+    }
+}
+
+#[cfg(test)]
+mod demand_tests {
+    use super::*;
+
+    #[test]
+    fn cheap_attention_outranks_expensive_attention() {
+        // The reason this exists at all. Twenty blocked agents are unworkable if you
+        // cannot tell which ones you could clear on the way past.
+        assert!(
+            demand_class(AgentState::Blocked, BlockerKind::Permission, false, false)
+                < demand_class(AgentState::Blocked, BlockerKind::Question, false, false)
+        );
+    }
+
+    #[test]
+    fn a_lost_host_outranks_everything_and_ignores_the_last_known_state() {
+        // A pane whose machine went away may well have been Idle when the link died.
+        // Reporting that would present lost work as finished work.
+        for state in [
+            AgentState::Idle,
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Unknown,
+        ] {
+            assert_eq!(
+                demand_class(state, BlockerKind::Unknown, true, true),
+                Some(DemandClass::Fault),
+                "{state:?} on a stopped host must rank as a fault"
+            );
+        }
+        assert!(Some(DemandClass::Fault) < Some(DemandClass::BlockedDecision));
+    }
+
+    #[test]
+    fn working_is_not_a_demand() {
+        // It is not waiting for anybody, and queueing it would bury the ones that are.
+        assert_eq!(
+            demand_class(AgentState::Working, BlockerKind::Unknown, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_finished_agent_stops_being_a_demand_once_it_has_been_seen() {
+        assert_eq!(
+            demand_class(AgentState::Idle, BlockerKind::Unknown, false, false),
+            Some(DemandClass::Done)
+        );
+        assert_eq!(
+            demand_class(AgentState::Idle, BlockerKind::Unknown, true, false),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_blocker_ranks_after_the_known_kinds_rather_than_guessing() {
+        // Guessing it into `permission` would send someone to a question expecting a
+        // keystroke, which costs exactly the attention this ordering protects.
+        assert!(
+            demand_class(AgentState::Blocked, BlockerKind::Question, false, false)
+                < demand_class(AgentState::Blocked, BlockerKind::Unknown, false, false)
+        );
     }
 }
 

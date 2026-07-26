@@ -712,28 +712,77 @@ impl App {
         Some((target.ws_idx, target.pane_id))
     }
 
-    fn relative_agent_entry(&self, forward: bool) -> Option<(usize, usize, crate::layout::PaneId)> {
+    fn relative_agent_entry(
+        &mut self,
+        forward: bool,
+    ) -> Option<(usize, usize, crate::layout::PaneId)> {
         let entries = crate::ui::agent_panel_entries(&self.state);
         if entries.is_empty() {
+            self.state.attention_cursor = None;
             return None;
         }
+        let present: Vec<crate::layout::PaneId> =
+            entries.iter().map(|entry| entry.pane_id).collect();
+
         let focused = self
             .state
             .active
             .and_then(|idx| self.state.workspaces.get(idx))
             .and_then(crate::workspace::Workspace::focused_pane_id);
-        let current_idx = entries
-            .iter()
-            .position(|entry| Some(entry.pane_id) == focused);
-        let next_idx = match (current_idx, forward) {
-            (Some(idx), true) => (idx + 1) % entries.len(),
-            (Some(0), false) => entries.len() - 1,
-            (Some(idx), false) => idx - 1,
-            (None, true) => 0,
-            (None, false) => entries.len() - 1,
-        };
-        let target = entries.get(next_idx)?;
-        Some((next_idx, target.ws_idx, target.pane_id))
+
+        // Reuse the frozen order while the same panes are on offer. Re-deriving it
+        // every press is what makes "next" bounce: landing on a pane marks it seen,
+        // which changes its rank, so the list reorders underneath and the step lands
+        // back where it started. Rebuild only when panes actually appear or disappear,
+        // because then the old order genuinely no longer describes the choices.
+        let reusable = self
+            .state
+            .attention_cursor
+            .as_ref()
+            .is_some_and(|cursor| Self::same_pane_set(&cursor.order, &present));
+        if !reusable {
+            self.state.attention_cursor = Some(crate::app::state::AttentionCursor {
+                order: present.clone(),
+                // Start from where the user already is, so the first press moves one
+                // step rather than jumping to the top of a list they are inside.
+                index: focused
+                    .and_then(|pane| present.iter().position(|candidate| *candidate == pane))
+                    .unwrap_or(if forward { usize::MAX } else { 0 }),
+            });
+        }
+
+        let cursor = self.state.attention_cursor.as_mut()?;
+        let len = cursor.order.len();
+        // A pane can leave the panel mid-sweep, so step until something still on offer
+        // turns up rather than jumping to a pane that is no longer there.
+        let mut candidate = None;
+        for _ in 0..len {
+            cursor.index = match (cursor.index, forward) {
+                (usize::MAX, true) => 0,
+                (idx, true) => (idx + 1) % len,
+                (0, false) => len - 1,
+                (idx, false) => idx - 1,
+            };
+            let pane = cursor.order[cursor.index];
+            if let Some(position) = present.iter().position(|current| *current == pane) {
+                candidate = Some((position, pane));
+                break;
+            }
+        }
+        let (position, pane) = candidate?;
+        let entry = entries.get(position)?;
+        Some((position, entry.ws_idx, pane))
+    }
+
+    /// Whether two orders offer the same panes, regardless of arrangement.
+    ///
+    /// Order deliberately ignored: a changed order is the normal case this exists to
+    /// ride out, and treating it as a reason to rebuild would defeat the mechanism.
+    fn same_pane_set(left: &[crate::layout::PaneId], right: &[crate::layout::PaneId]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        left.iter().all(|pane| right.contains(pane))
     }
 
     fn pass_through_key_to_focused_pane(&mut self, key: TerminalKey) -> bool {
@@ -1848,6 +1897,86 @@ mod tests {
     use crate::{
         app::App, config::Config, input::TerminalKey, terminal::TerminalState, workspace::Workspace,
     };
+
+    /// Stepping must walk a sequence, not chase a list that reorders underneath it.
+    ///
+    /// This is the bug the frozen cursor exists for: landing on a pane marks it seen,
+    /// which changes its rank, so a freshly-derived order can put the pane you just
+    /// left back where you are about to step — and "next" returns you to it.
+    #[test]
+    fn stepping_through_agents_does_not_revisit_until_the_sweep_wraps() {
+        let mut app = app_with_test_workspaces(&["one", "two", "three"]);
+        // Priority is the mode where the panel reorders by attention, and therefore
+        // the only mode where the order can move under a sweep. In workspace order it
+        // never moves and this would pass without testing anything.
+        app.state.agent_panel_sort = crate::app::state::AgentPanelSort::Priority;
+        // The default agent view shows panes that have an agent, so give them one:
+        // without it the panel is empty and the sweep would pass vacuously.
+        let terminal_ids: Vec<_> = app.state.terminals.keys().cloned().collect();
+        for terminal_id in terminal_ids {
+            if let Some(terminal) = app.state.terminals.get_mut(&terminal_id) {
+                terminal.detected_agent = Some(crate::detect::Agent::Pi);
+                terminal.state = crate::detect::AgentState::Blocked;
+            }
+        }
+        let panes: Vec<crate::layout::PaneId> = crate::ui::agent_panel_entries(&app.state)
+            .iter()
+            .map(|entry| entry.pane_id)
+            .collect();
+        assert!(
+            panes.len() >= 2,
+            "need at least two panes for a sweep to be meaningful"
+        );
+
+        let mut visited = Vec::new();
+        for _ in 0..panes.len() {
+            let Some((_, ws_idx, pane)) = app.relative_agent_entry(true) else {
+                break;
+            };
+            assert!(
+                !visited.contains(&pane),
+                "revisited {pane:?} before the sweep wrapped: {visited:?}"
+            );
+            visited.push(pane);
+
+            // Reproduce the thing that actually breaks this: arriving at a pane
+            // changes its rank, so the derived order is different on the next press.
+            // Without a frozen order the step lands back on a pane already visited.
+            let terminal_id = app.state.workspaces[ws_idx]
+                .panes
+                .get(&pane)
+                .map(|state| state.attached_terminal_id.clone());
+            if let Some(terminal) = terminal_id
+                .as_ref()
+                .and_then(|id| app.state.terminals.get_mut(id))
+            {
+                terminal.state = crate::detect::AgentState::Idle;
+            }
+        }
+        assert_eq!(visited.len(), panes.len(), "sweep should reach every pane");
+    }
+
+    #[test]
+    fn the_traversal_order_is_rebuilt_when_the_panes_on_offer_change() {
+        // Freezing has to be temporary. A cursor that outlived the panes it described
+        // would step to somewhere that no longer exists.
+        let before = vec![
+            crate::layout::PaneId::from_raw(1),
+            crate::layout::PaneId::from_raw(2),
+        ];
+        let same_order_different_arrangement = vec![
+            crate::layout::PaneId::from_raw(2),
+            crate::layout::PaneId::from_raw(1),
+        ];
+        let different = vec![crate::layout::PaneId::from_raw(1)];
+
+        // Reordering alone must NOT rebuild — that is the case being ridden out.
+        assert!(App::same_pane_set(
+            &before,
+            &same_order_different_arrangement
+        ));
+        assert!(!App::same_pane_set(&before, &different));
+    }
 
     fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {
         state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

@@ -1530,6 +1530,15 @@ pub(crate) struct PaneFocusTarget {
 
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
+/// A sweep through the agents wanting attention, in the order they had when it began.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttentionCursor {
+    /// The panes to walk, captured once.
+    pub(crate) order: Vec<PaneId>,
+    /// Where the last jump landed.
+    pub(crate) index: usize,
+}
+
 pub struct AppState {
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
@@ -1600,6 +1609,14 @@ pub struct AppState {
     pub(crate) tab_press: Option<TabPressState>,
     pub selection: Option<Selection>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
+    /// Frozen traversal order for stepping between agents that want attention.
+    ///
+    /// Client-side navigation state, not a runtime fact. It exists because the sorted
+    /// list moves under you: jumping to a pane marks it seen, which changes its rank,
+    /// so re-deriving the order on every press can step you back onto the pane you
+    /// just left. Freezing the order for the duration of a sweep makes "next" walk a
+    /// sequence instead of chasing a moving target.
+    pub(crate) attention_cursor: Option<AttentionCursor>,
     pub context_menu: Option<ContextMenuState>,
     // Notifications
     pub update_available: Option<String>,
@@ -1986,6 +2003,7 @@ impl AppState {
             workspace_press: None,
             tab_press: None,
             selection: None,
+            attention_cursor: None,
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,
