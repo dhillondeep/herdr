@@ -533,9 +533,18 @@ pub(crate) fn attention_match(
     agent: &crate::api::schema::AgentInfo,
     until: &[crate::api::schema::AgentStatus],
     host: Option<&str>,
+    blocker: &[crate::api::schema::BlockerKind],
 ) -> bool {
     if agent.launch_pending {
         return false;
+    }
+    if !blocker.is_empty() {
+        // An unknown kind never matches. Treating it as "might be the one you asked
+        // for" would send someone to a question they asked not to be given.
+        match agent.blocker {
+            Some(kind) if blocker.contains(&kind) => {}
+            _ => return false,
+        }
     }
     if let Some(host) = host {
         // Absent means local, which no host filter should match: asking for a machine
@@ -558,6 +567,7 @@ pub(super) fn wait_for_attention(
 ) -> std::io::Result<Option<String>> {
     let until = attention_wait_statuses(params.until);
     let host = params.host.clone();
+    let blocker = params.blocker.clone();
     // Zero would match before anything happened, which is never what a caller means.
     let want = params.count.unwrap_or(1).max(1);
     let deadline = params
@@ -565,7 +575,7 @@ pub(super) fn wait_for_attention(
         .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 
     loop {
-        match attention_matches(&request_id, &until, host.as_deref(), api_tx) {
+        match attention_matches(&request_id, &until, host.as_deref(), &blocker, api_tx) {
             Ok(matched) if matched.len() >= want => {
                 return serde_json::to_string(&SuccessResponse {
                     id: request_id,
@@ -609,6 +619,7 @@ fn attention_matches(
     request_id: &str,
     until: &[crate::api::schema::AgentStatus],
     host: Option<&str>,
+    blocker: &[crate::api::schema::BlockerKind],
     api_tx: &ApiRequestSender,
 ) -> Result<Vec<crate::api::schema::AgentInfo>, ErrorResponse> {
     let response = dispatch_to_app_with_timeout(
@@ -636,7 +647,7 @@ fn attention_matches(
 
     Ok(agents
         .into_iter()
-        .filter(|agent| attention_match(agent, until, host))
+        .filter(|agent| attention_match(agent, until, host, blocker))
         .collect())
 }
 
@@ -914,7 +925,7 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod attention_tests {
     use super::attention_match;
-    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::api::schema::{AgentInfo, AgentStatus, BlockerKind};
 
     fn agent(status: AgentStatus, host: Option<&str>) -> AgentInfo {
         AgentInfo {
@@ -928,6 +939,7 @@ mod attention_tests {
             terminal_title_stripped: None,
             display_agent: None,
             agent_status: status,
+            blocker: None,
             screen_detection_skipped: false,
             state_labels: Default::default(),
             tokens: Default::default(),
@@ -969,7 +981,8 @@ mod attention_tests {
         assert!(attention_match(
             &agent(AgentStatus::Blocked, None),
             &until,
-            None
+            None,
+            &[]
         ));
         for status in [
             AgentStatus::Working,
@@ -978,7 +991,7 @@ mod attention_tests {
             AgentStatus::Unknown,
         ] {
             assert!(
-                !attention_match(&agent(status, None), &until, None),
+                !attention_match(&agent(status, None), &until, None, &[]),
                 "{status:?} should not wake a wait for blocked"
             );
         }
@@ -990,12 +1003,14 @@ mod attention_tests {
         assert!(attention_match(
             &agent(AgentStatus::Blocked, Some("box1")),
             &until,
-            Some("box1")
+            Some("box1"),
+            &[],
         ));
         assert!(!attention_match(
             &agent(AgentStatus::Blocked, Some("box2")),
             &until,
-            Some("box1")
+            Some("box1"),
+            &[],
         ));
         // A local pane has no host. Asking for a machine by name and being handed a
         // local pane would be actively misleading — the caller is about to act on
@@ -1003,7 +1018,8 @@ mod attention_tests {
         assert!(!attention_match(
             &agent(AgentStatus::Blocked, None),
             &until,
-            Some("box1")
+            Some("box1"),
+            &[]
         ));
     }
 
@@ -1015,7 +1031,8 @@ mod attention_tests {
             assert!(attention_match(
                 &agent(AgentStatus::Blocked, host),
                 &until,
-                None
+                None,
+                &[]
             ));
         }
     }
@@ -1026,7 +1043,57 @@ mod attention_tests {
         // waking someone for it wastes the one thing this is meant to protect.
         let mut pending = agent(AgentStatus::Blocked, None);
         pending.launch_pending = true;
-        assert!(!attention_match(&pending, &[AgentStatus::Blocked], None));
+        assert!(!attention_match(
+            &pending,
+            &[AgentStatus::Blocked],
+            None,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn a_blocker_filter_narrows_within_blocked() {
+        // The reason the kind is tracked at all: batching cheap approvals without
+        // being pulled into a question that needs thinking about.
+        let until = [AgentStatus::Blocked];
+        let mut permission = agent(AgentStatus::Blocked, None);
+        permission.blocker = Some(BlockerKind::Permission);
+        let mut question = agent(AgentStatus::Blocked, None);
+        question.blocker = Some(BlockerKind::Question);
+
+        assert!(attention_match(
+            &permission,
+            &until,
+            None,
+            &[BlockerKind::Permission]
+        ));
+        assert!(!attention_match(
+            &question,
+            &until,
+            None,
+            &[BlockerKind::Permission]
+        ));
+        // No filter means every blocked agent, whatever kind.
+        assert!(attention_match(&question, &until, None, &[]));
+    }
+
+    #[test]
+    fn an_unknown_blocker_kind_never_matches_a_filter() {
+        // Guessing would defeat the point. A question answered as if it were a quick
+        // approval costs exactly the attention the filter exists to protect, so an
+        // agent whose kind the rule did not say is left out rather than included on
+        // the chance it might be the one asked for.
+        let until = [AgentStatus::Blocked];
+        let mut unspecified = agent(AgentStatus::Blocked, None);
+        unspecified.blocker = None;
+        assert!(!attention_match(
+            &unspecified,
+            &until,
+            None,
+            &[BlockerKind::Permission]
+        ));
+        // And it still matches when no kind was asked for.
+        assert!(attention_match(&unspecified, &until, None, &[]));
     }
 
     #[test]
@@ -1035,17 +1102,20 @@ mod attention_tests {
         assert!(attention_match(
             &agent(AgentStatus::Blocked, None),
             &until,
-            None
+            None,
+            &[]
         ));
         assert!(attention_match(
             &agent(AgentStatus::Done, None),
             &until,
-            None
+            None,
+            &[]
         ));
         assert!(!attention_match(
             &agent(AgentStatus::Working, None),
             &until,
-            None
+            None,
+            &[]
         ));
     }
 }

@@ -215,6 +215,7 @@ pub(super) enum DetectionPublishDecision {
     NoPublish,
     Publish {
         state: AgentState,
+        blocker: crate::detect::BlockerKind,
         visible_idle: bool,
         visible_blocker: bool,
         visible_working: bool,
@@ -278,6 +279,15 @@ pub(super) fn decide_screen_detection_publish(
         DetectionTransitionDecision::NoPublish => DetectionPublishDecision::NoPublish,
         DetectionTransitionDecision::PublishNext => DetectionPublishDecision::Publish {
             state: new_state,
+            // Taken from the detection that produced this publish, and only when the
+            // published state really is blocked: the stabiliser can turn a blocked
+            // detection into something else, and carrying the kind across that would
+            // claim a pane needs a decision it is no longer waiting on.
+            blocker: if new_state == AgentState::Blocked {
+                detection.blocker
+            } else {
+                crate::detect::BlockerKind::Unknown
+            },
             visible_idle,
             visible_blocker,
             visible_working,
@@ -506,6 +516,7 @@ mod tests {
             ),
             DetectionPublishDecision::Publish {
                 state: AgentState::Working,
+                blocker: crate::detect::BlockerKind::Unknown,
                 visible_idle: false,
                 visible_blocker: false,
                 visible_working: true,
@@ -526,6 +537,7 @@ mod tests {
             ),
             DetectionPublishDecision::Publish {
                 state: AgentState::Idle,
+                blocker: crate::detect::BlockerKind::Unknown,
                 visible_idle: true,
                 visible_blocker: false,
                 visible_working: false,

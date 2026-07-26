@@ -380,6 +380,13 @@ impl App {
             terminal_title_stripped: pane.terminal_title_stripped,
             display_agent: pane.display_agent,
             agent_status: pane.agent_status,
+            // Only reported while actually blocked, and `Unknown` is suppressed rather
+            // than sent: a field saying "blocked, kind unknown" reads as information
+            // when it is the absence of it, and a caller filtering on kinds would have
+            // to special-case it anyway.
+            blocker: (pane.agent_status == crate::api::schema::AgentStatus::Blocked
+                && terminal.blocker != crate::detect::BlockerKind::Unknown)
+                .then(|| crate::api::schema::BlockerKind::from(terminal.blocker)),
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,
             tokens: pane.tokens,

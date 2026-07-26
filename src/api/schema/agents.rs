@@ -47,6 +47,18 @@ pub struct AttentionWaitParams {
     /// Restrict to one machine. Absent means every machine, which is the point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Restrict to blocked agents needing a particular kind of attention.
+    ///
+    /// Separate from `until` because it is a different axis: `until` picks states,
+    /// this narrows *within* blocked. Waiting only for `permission` is a way to batch
+    /// the cheap approvals without being pulled into a question that needs thinking
+    /// about, which is the whole reason the kind is tracked.
+    ///
+    /// Agents whose kind is unknown never match a `blocker` filter. Guessing would
+    /// defeat the point: a question answered as if it were a quick approval costs
+    /// exactly the attention this is meant to protect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocker: Vec<super::BlockerKind>,
     /// Return once this many agents match at the same time. Defaults to 1.
     ///
     /// Useful for batching: waiting for three before walking over rather than being
@@ -234,6 +246,10 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// What kind of attention this agent needs. Only present while blocked, and only
+    /// when the rule that matched actually says which kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<super::BlockerKind>,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

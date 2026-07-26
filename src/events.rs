@@ -61,6 +61,9 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
+        /// What kind of attention a blocked agent needs, from the rule that matched.
+        /// Meaningless unless `state` is `Blocked`.
+        blocker: crate::detect::BlockerKind,
         visible_blocker: bool,
         visible_working: bool,
         process_exited: bool,

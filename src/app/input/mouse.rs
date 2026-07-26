@@ -2644,6 +2644,7 @@ mod tests {
                 pane_id: target_pane,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
+                blocker: crate::detect::BlockerKind::Unknown,
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: false,

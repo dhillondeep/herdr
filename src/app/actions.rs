@@ -2678,13 +2678,14 @@ impl AppState {
                 pane_id,
                 agent,
                 state,
+                blocker,
                 visible_blocker,
                 visible_working,
                 process_exited,
                 observed_at,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    Some(terminal.set_detected_state_with_screen_signals_at(
+                    let mutation = terminal.set_detected_state_with_screen_signals_at(
                         agent,
                         state,
                         visible_blocker,
@@ -2692,7 +2693,18 @@ impl AppState {
                         visible_working,
                         process_exited,
                         observed_at,
-                    ))
+                    );
+                    // Keyed off the state the terminal actually settled on, not the
+                    // state this event proposed. Hook authority can override the
+                    // detector, and a blocker kind left over from an overridden
+                    // detection would claim a pane is waiting for a decision that
+                    // something else has already decided.
+                    terminal.blocker = if terminal.state == crate::detect::AgentState::Blocked {
+                        blocker
+                    } else {
+                        crate::detect::BlockerKind::Unknown
+                    };
+                    Some(mutation)
                 })
                 .into_iter()
                 .collect(),
@@ -4541,6 +4553,79 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_state_carries_its_blocker_kind_onto_the_terminal() {
+        // The end of the plumb: the kind is read from the rule inside detection, and
+        // this is where it has to land to be answerable over the API.
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Permission,
+            visible_blocker: true,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(terminal.state, AgentState::Blocked);
+        assert_eq!(terminal.blocker, crate::detect::BlockerKind::Permission);
+    }
+
+    #[test]
+    fn leaving_the_blocked_state_clears_the_blocker_kind() {
+        // Otherwise a resolved permission prompt keeps claiming a keystroke is owed,
+        // and a caller filtering on "needs a decision" is sent back to a pane that
+        // does not.
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let now = std::time::Instant::now();
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Question,
+            visible_blocker: true,
+            visible_working: false,
+            process_exited: false,
+            observed_at: now,
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Question,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: now + std::time::Duration::from_secs(1),
+        });
+
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(
+            terminal.blocker,
+            crate::detect::BlockerKind::Unknown,
+            "a non-blocked state must not keep a blocker kind"
+        );
+    }
+
+    #[test]
     fn state_changed_updates_pane() {
         let mut state = app_with_workspaces(&["test"]);
         let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
@@ -4549,6 +4634,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4587,6 +4673,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4620,6 +4707,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4642,6 +4730,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4663,6 +4752,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Unknown,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4672,6 +4762,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4717,6 +4808,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4741,6 +4833,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4773,6 +4866,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4784,6 +4878,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
@@ -4807,6 +4902,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4832,6 +4928,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4859,6 +4956,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4914,6 +5012,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4932,6 +5031,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: true,
             visible_working: false,
             process_exited: false,
@@ -4962,6 +5062,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4985,6 +5086,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5011,6 +5113,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
@@ -5071,6 +5174,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Devin),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5203,6 +5307,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5232,6 +5337,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5258,6 +5364,7 @@ mod tests {
             pane_id: bg_pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5281,6 +5388,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5302,6 +5410,7 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
+            blocker: crate::detect::BlockerKind::Unknown,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,

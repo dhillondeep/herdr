@@ -149,6 +149,35 @@ pub enum AgentStatus {
     Unknown,
 }
 
+/// What kind of attention a blocked agent needs.
+///
+/// A permission prompt is a two-second keystroke; an open question is a two-minute
+/// think. Ranking them together is why a long list of blocked agents is hard to work
+/// through — the cheap ones should be dispatchable first.
+///
+/// `Unknown` is a real answer, not a placeholder: several manifest rules genuinely do
+/// not say which kind they matched, and a question filed as a quick permission wastes
+/// exactly the attention this exists to save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerKind {
+    Permission,
+    Question,
+    Selection,
+    Unknown,
+}
+
+impl From<crate::detect::BlockerKind> for BlockerKind {
+    fn from(kind: crate::detect::BlockerKind) -> Self {
+        match kind {
+            crate::detect::BlockerKind::Permission => Self::Permission,
+            crate::detect::BlockerKind::Question => Self::Question,
+            crate::detect::BlockerKind::Selection => Self::Selection,
+            crate::detect::BlockerKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
 pub(crate) fn default_true() -> bool {
     true
 }

@@ -139,6 +139,13 @@ pub struct TerminalState {
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
     pub state: AgentState,
+    /// What kind of attention a blocked agent needs.
+    ///
+    /// Set beside `state` rather than inside the state setter, because the setter is
+    /// also the hook-authority path where no rule matched and there is nothing to
+    /// classify. Always `Unknown` when `state` is not `Blocked`, so a resolved prompt
+    /// cannot leave a stale claim that a keystroke is still owed.
+    pub blocker: crate::detect::BlockerKind,
     pub last_agent_state_change_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -172,6 +179,7 @@ impl TerminalState {
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
+            blocker: crate::detect::BlockerKind::Unknown,
             last_agent_state_change_seq: None,
             revision: 0,
             launch_argv: None,

@@ -7,7 +7,7 @@
 //! it: you would need to know which one to watch, which is what you are trying to
 //! find out.
 
-use crate::api::schema::{AttentionWaitParams, Method, Request};
+use crate::api::schema::{AttentionWaitParams, BlockerKind, Method, Request};
 
 pub fn run_attention_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(|arg| arg.as_str()) {
@@ -34,12 +34,15 @@ fn usage() {
     eprintln!("demand, and including it would make this return almost immediately in a");
     eprintln!("fleet where something finishes every few minutes.");
     eprintln!();
-    eprintln!("  --count N   wait for N at once, to be interrupted once instead of N times");
+    eprintln!("  --count N     wait for N at once, to be interrupted once instead of N times");
+    eprintln!("  --blocker K   only blocked agents needing permission, question, or selection;");
+    eprintln!("                agents whose kind is unknown never match");
 }
 
 fn attention_wait(args: &[String]) -> std::io::Result<i32> {
     let mut until = Vec::new();
     let mut host = None;
+    let mut blocker = Vec::new();
     let mut count = None;
     let mut timeout_ms = None;
 
@@ -61,6 +64,32 @@ fn attention_wait(args: &[String]) -> std::io::Result<i32> {
                         return Ok(2);
                     }
                 }
+                index += 2;
+            }
+            // Narrows within blocked rather than picking a state, so it is its own
+            // flag. Batching the cheap approvals is the point: being pulled into a
+            // question that needs thinking about is the interruption people are
+            // trying to avoid.
+            "--blocker" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("--blocker requires a kind");
+                    return Ok(2);
+                };
+                let kind = match value.as_str() {
+                    "permission" => BlockerKind::Permission,
+                    "question" => BlockerKind::Question,
+                    "selection" => BlockerKind::Selection,
+                    other => {
+                        // `unknown` is deliberately not accepted: an agent whose kind
+                        // is unknown never matches a filter, so asking for it would
+                        // wait forever and look like a bug.
+                        eprintln!(
+                            "invalid blocker kind: {other} (expected permission, question, or selection)"
+                        );
+                        return Ok(2);
+                    }
+                };
+                blocker.push(kind);
                 index += 2;
             }
             "--host" => {
@@ -117,6 +146,7 @@ fn attention_wait(args: &[String]) -> std::io::Result<i32> {
         method: Method::AttentionWait(AttentionWaitParams {
             until,
             host,
+            blocker,
             count,
             timeout_ms,
         }),

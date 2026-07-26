@@ -1684,6 +1684,13 @@
         "AttentionWaitParams": {
           "description": "Wait until some agent *anywhere* wants attention.\n\n`agent.wait` takes exactly one target, so the question a person with twenty agents\non five machines actually has — \"tell me when any of them needs me\" — cannot be\nasked. Watching them one at a time is not equivalent: you would have to know which\none to watch, which is the thing you are trying to find out.",
           "properties": {
+            "blocker": {
+              "description": "Restrict to blocked agents needing a particular kind of attention.\n\nSeparate from `until` because it is a different axis: `until` picks states,\nthis narrows *within* blocked. Waiting only for `permission` is a way to batch\nthe cheap approvals without being pulled into a question that needs thinking\nabout, which is the whole reason the kind is tracked.\n\nAgents whose kind is unknown never match a `blocker` filter. Guessing would\ndefeat the point: a question answered as if it were a quick approval costs\nexactly the attention this is meant to protect.",
+              "items": {
+                "$ref": "#/schemas/request/$defs/BlockerKind"
+              },
+              "type": "array"
+            },
             "count": {
               "description": "Return once this many agents match at the same time. Defaults to 1.\n\nUseful for batching: waiting for three before walking over rather than being\ninterrupted three times.",
               "format": "uint",
@@ -1717,6 +1724,16 @@
             }
           },
           "type": "object"
+        },
+        "BlockerKind": {
+          "description": "What kind of attention a blocked agent needs.\n\nA permission prompt is a two-second keystroke; an open question is a two-minute\nthink. Ranking them together is why a long list of blocked agents is hard to work\nthrough — the cheap ones should be dispatchable first.\n\n`Unknown` is a real answer, not a placeholder: several manifest rules genuinely do\nnot say which kind they matched, and a question filed as a quick permission wastes\nexactly the attention this exists to save.",
+          "enum": [
+            "permission",
+            "question",
+            "selection",
+            "unknown"
+          ],
+          "type": "string"
         },
         "ClientWindowTitleSetParams": {
           "properties": {
@@ -6073,6 +6090,17 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "blocker": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/BlockerKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "What kind of attention this agent needs. Only present while blocked, and only\nwhen the rule that matched actually says which kind."
+            },
             "cwd": {
               "type": [
                 "string",
@@ -6289,6 +6317,16 @@
             "working",
             "blocked",
             "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "BlockerKind": {
+          "description": "What kind of attention a blocked agent needs.\n\nA permission prompt is a two-second keystroke; an open question is a two-minute\nthink. Ranking them together is why a long list of blocked agents is hard to work\nthrough — the cheap ones should be dispatchable first.\n\n`Unknown` is a real answer, not a placeholder: several manifest rules genuinely do\nnot say which kind they matched, and a question filed as a quick permission wastes\nexactly the attention this exists to save.",
+          "enum": [
+            "permission",
+            "question",
+            "selection",
             "unknown"
           ],
           "type": "string"
