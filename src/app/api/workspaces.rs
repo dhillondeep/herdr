@@ -67,7 +67,10 @@ impl App {
             Ok(index) => {
                 if let Some(host) = host {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
-                        workspace.host = Some(host.clone());
+                        // Through the setter: it discards git state read on the old
+                        // machine, which for a workspace that has just moved describes
+                        // the wrong repository entirely.
+                        workspace.set_host(Some(host.clone()));
                     }
                     // Start connecting now rather than when the first pane needs
                     // it, so nobody waits on an ssh handshake mid-interaction.

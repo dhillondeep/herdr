@@ -201,6 +201,13 @@ struct Shared {
     /// The process behind the live transport, so closing the link can unblock a
     /// reader that is parked on it.
     child: Mutex<Option<std::process::Child>>,
+    /// Callers waiting on an `Exec`, by request id.
+    ///
+    /// A map rather than a channel per call so a dead transport can fail every waiter
+    /// at once: an exec whose answer will never arrive has to return, or the thread
+    /// that asked is parked forever.
+    execs: Mutex<HashMap<u64, mpsc::Sender<ExecOutput>>>,
+    next_exec_id: AtomicU64,
     /// Channels closed while disconnected. Re-sent after a reconnect, otherwise
     /// closing a pane offline leaves its process running on the host forever.
     pending_shutdown: Mutex<Vec<ChannelId>>,
@@ -310,6 +317,27 @@ fn jitter_fraction() -> u64 {
         .map(|since| since.subsec_nanos() as u64)
         .unwrap_or(0)
 }
+
+/// What a command on the host printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    /// `None` when the process was killed by a signal or never started.
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl ExecOutput {
+    pub fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// How long to wait for a command on the host.
+///
+/// Bounded because callers are background workers that run on a timer: one wedged host
+/// must not accumulate parked threads, and a stale answer is no worse than none.
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Where ssh keeps the multiplexing socket for a host.
 ///
@@ -547,6 +575,8 @@ impl HostLink {
             closing: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             child: Mutex::new(None),
+            execs: Mutex::new(HashMap::new()),
+            next_exec_id: AtomicU64::new(1),
             pending_shutdown: Mutex::new(Vec::new()),
         });
 
@@ -599,6 +629,43 @@ impl HostLink {
             .lock()
             .map(|mut queue| std::mem::take(&mut *queue))
             .unwrap_or_default()
+    }
+
+    /// Run a command on the host and wait for what it printed.
+    ///
+    /// Blocking, and therefore for background work only — never the render path. It
+    /// exists so facts about the machine the work is on can be asked of that machine:
+    /// answering them locally is not merely unavailable but wrong, because a path that
+    /// happens to exist here describes a different repository entirely.
+    pub fn exec(&self, argv: &[String], cwd: Option<&str>) -> std::io::Result<ExecOutput> {
+        let id = self.shared.next_exec_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.shared
+            .execs
+            .lock()
+            .map_err(|_| poisoned())?
+            .insert(id, tx);
+
+        let sent = self.shared.wire.send(&ToHost::Exec {
+            id,
+            argv: argv.to_vec(),
+            cwd: cwd.map(str::to_string),
+        })?;
+        if !sent {
+            self.shared.execs.lock().ok().map(|mut map| map.remove(&id));
+            return Err(std::io::Error::other("host link is reconnecting"));
+        }
+
+        match rx.recv_timeout(EXEC_TIMEOUT) {
+            Ok(output) => Ok(output),
+            // Either the deadline passed or the transport died and dropped the sender.
+            // Both mean no answer is coming, and both must clear the registration or
+            // the map grows for the life of the link.
+            Err(_) => {
+                self.shared.execs.lock().ok().map(|mut map| map.remove(&id));
+                Err(std::io::Error::other("no answer from the host"))
+            }
+        }
     }
 
     /// Why a channel ended, if the host said.
@@ -1067,8 +1134,29 @@ fn dispatch_from_host(
                 // the same EOF a local PTY produces when its child dies.
                 close_channel(&shared.channels, channel);
             }
+            FromHost::ExecResult {
+                id,
+                code,
+                stdout,
+                stderr,
+            } => {
+                if let Some(waiter) = shared.execs.lock().ok().and_then(|mut map| map.remove(&id)) {
+                    let _ = waiter.send(ExecOutput {
+                        code,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
             FromHost::Spawned { .. } | FromHost::Welcome { .. } => {}
         }
+    }
+
+    // Every exec waiting on this transport will never be answered on it. Dropping the
+    // senders is what wakes those threads; leaving them registered would park each one
+    // until its own deadline for no reason.
+    if let Ok(mut execs) = shared.execs.lock() {
+        execs.clear();
     }
 
     // If the link died before a welcome, unblock the caller instead of leaving it

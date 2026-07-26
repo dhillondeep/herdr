@@ -15,7 +15,7 @@ use crate::pane::{PaneLaunchEnv, PaneState};
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalRuntimeRegistry, TerminalState};
 
 mod aggregate;
-mod git;
+pub(crate) mod git;
 mod tab;
 
 #[cfg(test)]
@@ -1091,11 +1091,29 @@ impl Workspace {
     /// repository — a branch and ahead/behind count belonging to some unrelated
     /// checkout that happens to share a path.
     ///
-    /// Reporting nothing is the honest answer until git runs on the host. Gated on
-    /// read rather than on write because several paths populate the cache, and a
-    /// wrong branch shown once is worse than a missing one shown always.
+    /// Git now runs on the host for remote workspaces, so the cached values describe
+    /// the right repository either way. What still has to hold is that nothing local
+    /// populates the cache for a host-bound workspace: binding a host clears it, and
+    /// the refresh worker sends those workspaces down the remote path exclusively.
     fn git_state_is_meaningful(&self) -> bool {
-        self.host.is_none()
+        true
+    }
+
+    /// Bind this workspace to a machine, or release it.
+    ///
+    /// Always go through this rather than assigning `host` directly. Everything cached
+    /// about git describes the machine the repository was last read on, so changing
+    /// that machine invalidates all of it — and a branch from an unrelated local
+    /// checkout shown against a remote workspace is worse than no branch at all,
+    /// because it looks like an answer.
+    pub fn set_host(&mut self, host: Option<crate::host::HostId>) {
+        if self.host == host {
+            return;
+        }
+        self.host = host;
+        self.cached_git_branch = None;
+        self.cached_git_ahead_behind = None;
+        self.cached_git_space = None;
     }
 
     pub fn branch(&self) -> Option<String> {
@@ -1675,12 +1693,14 @@ mod remote_git_tests {
     }
 
     #[test]
-    fn a_host_bound_workspace_reports_no_git_state() {
-        // The cache was filled by running git on THIS machine, so for a workspace
-        // whose files live elsewhere it describes the wrong repository. Showing a
-        // branch from an unrelated local checkout is worse than showing none.
+    fn binding_a_host_discards_git_state_read_from_this_machine() {
+        // The cache was filled by running git HERE, so for a workspace whose files
+        // live elsewhere it describes the wrong repository. Git now runs on the host
+        // for these, so the protection moved from hiding the values on read to
+        // discarding them on binding — but the thing being prevented is the same, and
+        // a branch from an unrelated local checkout is still worse than none.
         let mut ws = workspace_with_local_git_cache();
-        ws.host = crate::host::HostId::parse("coder.box1");
+        ws.set_host(crate::host::HostId::parse("coder.box1"));
 
         assert_eq!(ws.branch(), None);
         assert_eq!(ws.git_ahead_behind(), None);
@@ -1688,18 +1708,40 @@ mod remote_git_tests {
     }
 
     #[test]
-    fn binding_a_host_hides_git_state_that_was_already_cached() {
-        // The order matters: a workspace can acquire a host after git has already
-        // run against a local path, so gating on read has to cover a populated
-        // cache, not just an empty one.
-        let mut ws = workspace_with_local_git_cache();
-        assert!(ws.branch().is_some());
+    fn a_host_bound_workspace_shows_what_the_host_reported() {
+        // The point of running git remotely: these values are about the right
+        // repository, so they must not be suppressed the way local ones were.
+        let mut ws = Workspace::test_new("remote");
+        ws.set_host(crate::host::HostId::parse("coder.box1"));
+        ws.cached_git_branch = Some("main".to_string());
+        ws.cached_git_ahead_behind = Some((0, 2));
 
-        ws.host = crate::host::HostId::parse("coder.box1");
-        assert_eq!(
-            ws.branch(),
-            None,
-            "a cache populated before the binding must not leak afterwards"
-        );
+        assert_eq!(ws.branch().as_deref(), Some("main"));
+        assert_eq!(ws.git_ahead_behind(), Some((0, 2)));
+    }
+
+    #[test]
+    fn releasing_a_host_also_discards_what_that_host_reported() {
+        // The reverse direction, and just as wrong to skip: values read on a machine
+        // this workspace is no longer bound to describe a repository it no longer
+        // uses.
+        let mut ws = Workspace::test_new("remote");
+        ws.set_host(crate::host::HostId::parse("coder.box1"));
+        ws.cached_git_branch = Some("main".to_string());
+
+        ws.set_host(None);
+        assert_eq!(ws.branch(), None);
+    }
+
+    #[test]
+    fn rebinding_the_same_host_keeps_what_is_already_known() {
+        // Clearing on every assignment would blank the branch on each refresh that
+        // re-applies the same host, making it flicker for no reason.
+        let mut ws = Workspace::test_new("remote");
+        ws.set_host(crate::host::HostId::parse("coder.box1"));
+        ws.cached_git_branch = Some("main".to_string());
+
+        ws.set_host(crate::host::HostId::parse("coder.box1"));
+        assert_eq!(ws.branch().as_deref(), Some("main"));
     }
 }

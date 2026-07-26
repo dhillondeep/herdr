@@ -11,11 +11,19 @@ use crate::events::AppEvent;
 use crate::workspace::{GitStatusCacheEntry, Workspace, WorkspaceGitStatus};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// No `Debug`/`Eq`: a live host connection is neither printable nor comparable, and a
+// refresh item is compared only by the fields that identify the workspace.
+#[derive(Clone)]
 pub(crate) struct WorkspaceGitRefreshItem {
     pub(crate) workspace_id: String,
     pub(crate) resolved_identity_cwd: std::path::PathBuf,
     pub(crate) cache_key: std::path::PathBuf,
+    /// The machine this repository is on, when it is not this one.
+    ///
+    /// Carried per item rather than looked up in the worker because the worker runs on
+    /// a plain thread with no access to the app.
+    #[cfg(unix)]
+    pub(crate) host: Option<std::sync::Arc<crate::host::link::HostLink>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -672,6 +680,10 @@ impl App {
                     workspace_id: ws.id.clone(),
                     resolved_identity_cwd: cwd,
                     cache_key,
+                    // Only if a connection is already up. Opening one to answer a
+                    // background status poll would make a cosmetic refresh dial out.
+                    #[cfg(unix)]
+                    host: ws.host.as_ref().and_then(|host| self.live_host_link(host)),
                 })
             })
             .collect()
@@ -739,6 +751,30 @@ pub(crate) fn refresh_workspace_git_statuses_with_cache(
 ) -> WorkspaceGitRefreshOutput {
     let mut results = Vec::new();
     let mut cache_updates = Vec::new();
+
+    // Remote workspaces answer from their own machine and never touch the local cache:
+    // that cache is keyed on this filesystem's `.git` mtimes, which say nothing about a
+    // repository somewhere else, so an entry stored under it could never be invalidated.
+    #[cfg(unix)]
+    let (remote_items, items): (Vec<_>, Vec<_>) =
+        items.into_iter().partition(|item| item.host.is_some());
+    #[cfg(unix)]
+    for item in remote_items {
+        let Some(link) = item.host.as_ref() else {
+            continue;
+        };
+        let status = crate::workspace::git::remote::remote_git_status(
+            link,
+            &item.resolved_identity_cwd.to_string_lossy(),
+        );
+        results.push(crate::workspace::WorkspaceGitStatus {
+            workspace_id: item.workspace_id.clone(),
+            resolved_identity_cwd: item.resolved_identity_cwd.clone(),
+            branch: status.branch,
+            ahead_behind: status.ahead_behind,
+            space: None,
+        });
+    }
 
     for job in deduplicate_git_refresh_items(items, cache) {
         let (snapshot, cache_entry) =
@@ -817,11 +853,15 @@ mod tests {
                     workspace_id: "one".into(),
                     resolved_identity_cwd: nested.clone(),
                     cache_key: repo.clone(),
+                    #[cfg(unix)]
+                    host: None,
                 },
                 WorkspaceGitRefreshItem {
                     workspace_id: "two".into(),
                     resolved_identity_cwd: other.clone(),
                     cache_key: repo.clone(),
+                    #[cfg(unix)]
+                    host: None,
                 },
             ],
             &HashMap::new(),

@@ -20,7 +20,7 @@ pub use crate::protocol::wire::FramingError;
 /// per machine and may lag, so compatibility is a *range* rather than equality —
 /// see [`negotiate`]. Exact-match versioning here would mean one stale host
 /// bricks that host until re-provisioned.
-pub const HOST_PROTOCOL_VERSION: u32 = 4;
+pub const HOST_PROTOCOL_VERSION: u32 = 5;
 
 /// Oldest host protocol this build can still talk to.
 ///
@@ -31,7 +31,7 @@ pub const HOST_PROTOCOL_VERSION: u32 = 4;
 /// binary reports a clear version mismatch telling the user to re-provision, which
 /// `herdr host install` makes a one-liner. Once the message set settles this stops
 /// moving and the range starts doing real work.
-pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 4;
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 5;
 
 /// Cap on a single host frame. Output is chunked well below this; the cap exists
 /// so a corrupted length prefix cannot make us allocate wildly.
@@ -88,6 +88,23 @@ pub enum ToHost {
     /// by the daemon, which is where the pids actually live.
     Shutdown {
         channel: ChannelId,
+    },
+    /// Run a short command on the host and send back what it printed.
+    ///
+    /// Not a channel: a channel is a PTY with a lifetime, and this is a question with
+    /// an answer. It exists because several things herdr reports are facts about the
+    /// machine the work is on — what branch a repository is on, how far ahead it is —
+    /// and answering them from the local filesystem is not merely unavailable but
+    /// actively wrong, since a path that happens to exist locally describes a
+    /// different repository entirely.
+    ///
+    /// Deliberately not a general remote shell: the caller supplies argv, never a
+    /// command line, so nothing here parses or quotes on the host's behalf.
+    Exec {
+        /// Correlates the answer. Assigned by the local side.
+        id: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
     },
     /// Reconnecting: here is the epoch I last saw and how far I had read on each
     /// pane. Tell me, per pane, whether I can resume.
@@ -191,6 +208,14 @@ pub enum FromHost {
         available_from: u64,
         /// Where the live stream is now.
         out_offset: u64,
+    },
+    /// The answer to an `Exec`.
+    ExecResult {
+        id: u64,
+        /// `None` when the process was killed by a signal or never started.
+        code: Option<i32>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
     },
     /// The pane no longer exists.
     Gone {

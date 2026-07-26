@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod client {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 4;
+    pub const HOST_PROTOCOL_VERSION: u32 = 5;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -49,6 +49,14 @@ mod client {
         },
         Shutdown {
             channel: u64,
+        },
+        // Tags are positional in bincode, so every variant must exist here even
+        // where this test never sends it.
+        #[allow(dead_code)]
+        Exec {
+            id: u64,
+            argv: Vec<String>,
+            cwd: Option<String>,
         },
         Attach {
             host_epoch: u64,
@@ -99,6 +107,13 @@ mod client {
             channel: u64,
             available_from: u64,
             out_offset: u64,
+        },
+        #[allow(dead_code)]
+        ExecResult {
+            id: u64,
+            code: Option<i32>,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
         },
         Gone {
             channel: u64,

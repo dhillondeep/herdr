@@ -309,6 +309,22 @@ impl App {
     /// ssh handshake. That is a visible stall and should move to a background
     /// connect with the pane showing a connecting state; doing it here first keeps
     /// the change reviewable.
+    /// The connection to `host` if one is already up, never opening a new one.
+    ///
+    /// Separate from `host_link` because background pollers must not dial: a status
+    /// refresh that opens an ssh connection turns a cosmetic detail into network
+    /// traffic, and on a stopped workspace into a timeout every few seconds.
+    #[cfg(unix)]
+    pub(crate) fn live_host_link(
+        &self,
+        host: &crate::host::HostId,
+    ) -> Option<std::sync::Arc<crate::host::link::HostLink>> {
+        self.host_links
+            .lock()
+            .ok()
+            .and_then(|guard| guard.live.get(host).map(|c| std::sync::Arc::clone(&c.link)))
+    }
+
     #[cfg(unix)]
     pub(crate) fn host_link(
         &mut self,

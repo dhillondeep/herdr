@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 mod protocol {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 4;
+    pub const HOST_PROTOCOL_VERSION: u32 = 5;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -50,6 +50,13 @@ mod protocol {
         },
         Shutdown {
             channel: u64,
+        },
+        // Tags are positional in bincode, so the tail must exist even unused here.
+        #[allow(dead_code)]
+        Exec {
+            id: u64,
+            argv: Vec<String>,
+            cwd: Option<String>,
         },
     }
 

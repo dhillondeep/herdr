@@ -389,6 +389,15 @@ fn handle(
             }
         }
         ToHost::Shutdown { channel } => shutdown_channel(channels, channel),
+        ToHost::Exec { id, argv, cwd } => {
+            // On a thread: the read loop is what carries every pane's input, and a git
+            // command on a cold repository can take seconds. Blocking here would stall
+            // typing in every pane on this host.
+            let out = Arc::clone(out);
+            std::thread::spawn(move || {
+                send(&out, &run_exec(id, &argv, cwd.as_deref()));
+            });
+        }
         ToHost::Attach { host_epoch, panes } => {
             for (channel, offset) in panes {
                 answer_attach(out, channels, daemon_epoch, host_epoch, channel, offset);
@@ -480,6 +489,46 @@ fn answer_attach(
     };
     send(out, &answer);
     log.ready = true;
+}
+
+/// Run one command and describe what happened, without ever failing to answer.
+///
+/// An `Exec` that produces no reply would hang the caller, so every path here — a
+/// missing binary, a bad working directory — comes back as a result with the failure in
+/// `stderr` rather than as silence.
+fn run_exec(id: u64, argv: &[String], cwd: Option<&str>) -> FromHost {
+    let Some((program, args)) = argv.split_first() else {
+        return FromHost::ExecResult {
+            id,
+            code: None,
+            stdout: Vec::new(),
+            stderr: b"empty argv".to_vec(),
+        };
+    };
+
+    // argv is passed through as given. Nothing here builds a command line, so there is
+    // no shell on this path and nothing for a branch name or a path to be quoted
+    // against.
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+
+    match command.output() {
+        Ok(output) => FromHost::ExecResult {
+            id,
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        Err(err) => FromHost::ExecResult {
+            id,
+            code: None,
+            stdout: Vec::new(),
+            stderr: err.to_string().into_bytes(),
+        },
+    }
 }
 
 fn spawn_channel(

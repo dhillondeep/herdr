@@ -107,6 +107,14 @@ mod client {
         Shutdown {
             channel: u64,
         },
+        // Tags are positional in bincode, so every variant must exist here even
+        // where this test never sends it.
+        #[allow(dead_code)]
+        Exec {
+            id: u64,
+            argv: Vec<String>,
+            cwd: Option<String>,
+        },
         // Present only to keep the variant tags aligned with the real protocol.
         // bincode encodes an enum discriminant positionally, so a shim that omits a
         // variant silently renumbers every one after it and this whole test file
@@ -162,6 +170,13 @@ mod client {
             out_offset: u64,
         },
         #[allow(dead_code)]
+        ExecResult {
+            id: u64,
+            code: Option<i32>,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+        },
+        #[allow(dead_code)]
         Gone {
             channel: u64,
             reason: u8,
@@ -207,7 +222,7 @@ impl Bridge {
     fn spawn(argv: &[&str], rows: u16, cols: u16) -> Self {
         let (daemon, mut stdout, mut stdin) = Daemon::start();
 
-        client::write(&mut stdin, &ToHost::Hello { version: 4 }).expect("hello");
+        client::write(&mut stdin, &ToHost::Hello { version: 5 }).expect("hello");
         let welcome: FromHost = client::read(&mut stdout).expect("welcome");
         assert!(matches!(welcome, FromHost::Welcome { .. }));
 
