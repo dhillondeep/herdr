@@ -185,6 +185,13 @@ struct Shared {
     status: Mutex<LinkStatus>,
     /// Per-pane reconnect outcomes waiting to be read by the layers above.
     resume: Mutex<Vec<(ChannelId, PaneResume)>>,
+    /// Why each channel ended, kept after the channel itself is gone.
+    ///
+    /// The pane learns its process ended by seeing EOF on a socket, which says
+    /// nothing about why. Without this, a host that restarted is indistinguishable
+    /// from an agent that finished — and closing a pane as "done" when its machine
+    /// went away is the one outcome the epoch check exists to prevent.
+    gone: Mutex<HashMap<ChannelId, GoneReason>>,
     /// Set on an explicit close, so a redial is not attempted for a link nobody
     /// wants any more.
     closing: AtomicBool,
@@ -536,6 +543,7 @@ impl HostLink {
             epoch: AtomicU64::new(0),
             status: Mutex::new(LinkStatus::Reconnecting),
             resume: Mutex::new(Vec::new()),
+            gone: Mutex::new(HashMap::new()),
             closing: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             child: Mutex::new(None),
@@ -591,6 +599,18 @@ impl HostLink {
             .lock()
             .map(|mut queue| std::mem::take(&mut *queue))
             .unwrap_or_default()
+    }
+
+    /// Why a channel ended, if the host said.
+    ///
+    /// Read when the pane observes EOF, which is the moment it has to decide whether
+    /// this was an ordinary exit or a machine disappearing underneath it.
+    pub fn gone_reason(&self, channel: ChannelId) -> Option<GoneReason> {
+        self.shared
+            .gone
+            .lock()
+            .ok()
+            .and_then(|gone| gone.get(&channel).copied())
     }
 
     /// Whether a channel has lost output at any point in its life.
@@ -1019,6 +1039,9 @@ fn dispatch_from_host(
                 }
             }
             FromHost::Gone { channel, reason } => {
+                if let Ok(mut gone) = shared.gone.lock() {
+                    gone.insert(channel, reason);
+                }
                 match reason {
                     GoneReason::HostRestarted => {
                         // Said in the pane before it closes, because an agent that

@@ -940,6 +940,7 @@ mod attention_tests {
             display_agent: None,
             agent_status: status,
             blocker: None,
+            host_stopped: false,
             screen_detection_skipped: false,
             state_labels: Default::default(),
             tokens: Default::default(),

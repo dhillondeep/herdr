@@ -2152,9 +2152,34 @@ impl PaneRuntime {
                 }
             });
             let exit_events = events.clone();
+            // Remembered so the exit handler can ask the link *why* the channel ended.
+            // EOF on a socket says only that it ended, and reporting a machine that
+            // went away as an agent that finished is the one confusion the whole epoch
+            // check exists to prevent.
+            let exit_remote = match &io_kind {
+                ImportedIo::Remote { link, channel } => Some((Arc::clone(link), *channel)),
+                ImportedIo::LocalHandoff { .. } => None,
+            };
             let on_reader_exit = Box::new(move || {
-                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied { pane_id }));
-                debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
+                let host_stopped = exit_remote.as_ref().is_some_and(|(link, channel)| {
+                    matches!(
+                        link.gone_reason(*channel),
+                        Some(crate::host::protocol::GoneReason::HostRestarted)
+                    )
+                });
+                let event = if host_stopped {
+                    // NOT `PaneDied`: that removes the pane, which would also throw
+                    // away the last screen and the notice explaining what happened —
+                    // so the user would see a pane vanish with no reason given.
+                    AppEvent::PaneHostStopped { pane_id }
+                } else {
+                    AppEvent::PaneDied { pane_id }
+                };
+                let _ = rt.block_on(exit_events.send(event));
+                debug!(
+                    pane = pane_id.raw(),
+                    host_stopped, "handoff PTY actor exiting"
+                );
             });
             let actor = PtyIoActor::spawn(PtyIoActorConfig {
                 pane_id: pane_id.raw(),

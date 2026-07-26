@@ -6129,6 +6129,10 @@
                 "null"
               ]
             },
+            "host_stopped": {
+              "description": "The machine this agent ran on went away. The work did not finish; it was lost.",
+              "type": "boolean"
+            },
             "interactive_ready": {
               "type": "boolean"
             },

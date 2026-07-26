@@ -2622,6 +2622,10 @@ impl AppState {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
+            AppEvent::PaneHostStopped { pane_id } => {
+                self.handle_pane_host_stopped(pane_id);
+                Vec::new()
+            }
             AppEvent::UpdateReady {
                 version,
                 install_command,
@@ -3211,6 +3215,40 @@ impl AppState {
         }
 
         deliveries
+    }
+
+    /// A remote pane whose host restarted. The process is gone; the pane is not.
+    ///
+    /// Deliberately does almost nothing. The pane keeps its place in the layout, its
+    /// runtime, and its grid — which still holds the last thing the agent drew and the
+    /// notice saying the host restarted. Routing this through `handle_pane_died` would
+    /// remove all three, and the user would watch a pane disappear with no explanation
+    /// of where their work went.
+    fn handle_pane_host_stopped(&mut self, pane_id: PaneId) {
+        // Stale notifications are for a pane that is still doing something. This one
+        // is not, and a queued "your agent finished" would be actively wrong.
+        self.pending_agent_notifications.remove(&pane_id);
+
+        let Some(ws_idx) = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.find_tab_index_for_pane(pane_id).is_some())
+        else {
+            warn!(pane = pane_id.raw(), "PaneHostStopped for unknown pane");
+            return;
+        };
+        let Some(terminal_id) = self.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
+            terminal.host_stopped = true;
+            // Not `Idle`. Idle means finished and available, and this pane is neither:
+            // sorting it with the panes that are done is how a lost overnight run gets
+            // mistaken for a completed one.
+            terminal.state = crate::detect::AgentState::Unknown;
+            terminal.blocker = crate::detect::BlockerKind::Unknown;
+        }
+        self.mark_session_dirty();
     }
 
     fn handle_pane_died(&mut self, pane_id: PaneId) {
@@ -4550,6 +4588,56 @@ mod tests {
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert_eq!(state.workspaces[0].panes.keys().next().unwrap(), &first_id);
         state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_host_that_restarted_keeps_the_pane_instead_of_removing_it() {
+        // The whole point. `PaneDied` removes the pane, and with it the grid holding
+        // the last thing the agent drew and the notice saying the host restarted. A
+        // pane vanishing with no explanation is the worst version of this event.
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let before = state.workspaces[0].panes.len();
+
+        state.handle_app_event(AppEvent::PaneHostStopped { pane_id });
+
+        assert_eq!(
+            state.workspaces[0].panes.len(),
+            before,
+            "the pane must survive its host going away"
+        );
+        assert!(state.workspaces[0].panes.contains_key(&pane_id));
+
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert!(terminal.host_stopped);
+        // Not Idle. Idle means finished and available, and sorting a lost overnight
+        // run with the panes that completed is how the loss goes unnoticed.
+        assert_ne!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn an_ordinary_exit_still_removes_the_pane() {
+        // The distinction has to cut both ways, or every finished pane would pile up.
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+
+        state.handle_app_event(AppEvent::PaneDied { pane_id });
+
+        // Indexing workspaces[0] here would panic rather than assert: removing the
+        // last pane closes the workspace too.
+        assert!(
+            !state
+                .workspaces
+                .iter()
+                .any(|ws| ws.panes.contains_key(&pane_id)),
+            "an ordinary exit must remove the pane"
+        );
     }
 
     #[test]

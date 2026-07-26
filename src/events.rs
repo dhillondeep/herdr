@@ -56,6 +56,16 @@ pub struct WorktreeRemoveResult {
 pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied { pane_id: PaneId },
+    /// A remote pane's host restarted, so its process is gone but the pane is not.
+    ///
+    /// Distinct from `PaneDied` because the pane must SURVIVE: its last screen and the
+    /// notice explaining what happened are the only record of why the work stopped, and
+    /// removing the pane destroys both.
+    ///
+    /// Only produced on unix, where the remote pane path lives; the variant itself is
+    /// platform-neutral so the handling does not have to be conditional.
+    #[cfg_attr(windows, allow(dead_code))]
+    PaneHostStopped { pane_id: PaneId },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

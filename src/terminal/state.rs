@@ -146,6 +146,11 @@ pub struct TerminalState {
     /// classify. Always `Unknown` when `state` is not `Blocked`, so a resolved prompt
     /// cannot leave a stale claim that a keystroke is still owed.
     pub blocker: crate::detect::BlockerKind,
+    /// The machine this terminal's process ran on went away.
+    ///
+    /// Sticky, and never set for a local pane. Distinct from a process exiting: the
+    /// work did not finish, it was lost, and the two must not be presented alike.
+    pub host_stopped: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -180,6 +185,7 @@ impl TerminalState {
             metadata_token_sequence_sources: std::collections::HashSet::new(),
             state: AgentState::Unknown,
             blocker: crate::detect::BlockerKind::Unknown,
+            host_stopped: false,
             last_agent_state_change_seq: None,
             revision: 0,
             launch_argv: None,

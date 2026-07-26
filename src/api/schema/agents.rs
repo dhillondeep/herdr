@@ -250,6 +250,9 @@ pub struct AgentInfo {
     /// when the rule that matched actually says which kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<super::BlockerKind>,
+    /// The machine this agent ran on went away. The work did not finish; it was lost.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub host_stopped: bool,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
