@@ -336,7 +336,235 @@ struct Channel {
 /// byte in memory for an unbounded absence is how a daemon gets OOM-killed. A byte
 /// log with bounded replay is the next step; until then a reattach shows the screen
 /// from that moment on.
-type SharedOut = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+type SharedOut = Arc<Outbox>;
+
+/// How many frames may be queued for one channel before its oldest are dropped.
+///
+/// At the 8 KiB read chunk this is about half a megabyte in flight per pane. Large
+/// enough that an ordinary burst never drops anything; small enough that twenty panes
+/// cannot pin ten megabytes of unsent output.
+const MAX_QUEUED_FRAMES_PER_CHANNEL: usize = 64;
+
+/// Everything waiting to go to the attached client, and the thread that writes it.
+///
+/// This exists because writing directly from each channel's reader thread means one
+/// slow client stalls every pane. A reader would block on the socket while holding the
+/// shared writer, so a single pane streaming a build log stops the other nineteen —
+/// head-of-line blocking across channels, which no amount of buffering in the log
+/// fixes because the log is about memory, not about the client's read rate.
+///
+/// So readers only ever enqueue, and one writer drains round-robin.
+struct Outbox {
+    inner: Mutex<OutboxInner>,
+    /// Signals the writer that there is work, or that it should stop.
+    ready: std::sync::Condvar,
+    /// Signals waiters that everything queued has been written.
+    drained: std::sync::Condvar,
+}
+
+struct OutboxInner {
+    /// `None` while nobody is attached. Output produced then is dropped here rather
+    /// than queued: the log holds it, and buffering for an absent client without
+    /// bound is how a daemon gets OOM-killed.
+    writer: Option<Box<dyn Write + Send>>,
+    /// Frames belonging to no channel — the handshake, exec answers. Never dropped.
+    control: std::collections::VecDeque<FromHost>,
+    /// Per channel, in order. Ordered map so the round-robin is deterministic.
+    channels: std::collections::BTreeMap<ChannelId, std::collections::VecDeque<FromHost>>,
+    /// Where the last round-robin pass stopped, so no channel is served twice before
+    /// another is served once.
+    cursor: ChannelId,
+    /// Bytes dropped per channel, so a flooding pane is attributable rather than
+    /// merely suspected.
+    dropped: HashMap<ChannelId, u64>,
+    stop: bool,
+}
+
+impl Outbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(OutboxInner {
+                writer: None,
+                control: std::collections::VecDeque::new(),
+                channels: std::collections::BTreeMap::new(),
+                cursor: 0,
+                dropped: HashMap::new(),
+                stop: false,
+            }),
+            ready: std::sync::Condvar::new(),
+            drained: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Wait until everything queued has been written, or `timeout` passes.
+    ///
+    /// Needed because the writer is asynchronous and some frames are the last thing a
+    /// client will ever hear: refusing a version mismatch means sending the `Welcome`
+    /// that says which version, then closing. Returning without draining would close
+    /// first and leave the client to time out with no idea why.
+    fn drain(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        while inner.writer.is_some() && (!inner.control.is_empty() || inner.has_channel_work()) {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return;
+            };
+            let Ok((next, _)) = self.drained.wait_timeout(inner, remaining) else {
+                return;
+            };
+            inner = next;
+        }
+    }
+
+    fn install(&self, writer: Box<dyn Write + Send>) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.writer = Some(writer);
+        }
+        self.ready.notify_all();
+    }
+
+    /// Detach the client and discard everything queued for it.
+    ///
+    /// The queued frames are stale the moment the client goes: the next one attaches at
+    /// its own offset and is answered from the log, so delivering leftovers would put
+    /// frames in front of that answer and manufacture the very gap the ordering rules
+    /// exist to prevent.
+    fn detach(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.writer = None;
+            inner.control.clear();
+            inner.channels.clear();
+        }
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.stop = true;
+        }
+        self.ready.notify_all();
+    }
+
+    /// Bytes dropped for a channel because it outran the client.
+    fn dropped_bytes(&self, channel: ChannelId) -> u64 {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.dropped.get(&channel).copied())
+            .unwrap_or(0)
+    }
+}
+
+/// Which channel a frame belongs to, if any.
+///
+/// Everything about a channel shares that channel's queue so it stays in order with its
+/// output. A `Replay` overtaken by the `Data` that follows it would look to the client
+/// exactly like the gap the resume ordering was built to rule out.
+fn frame_channel(message: &FromHost) -> Option<ChannelId> {
+    match message {
+        FromHost::Data { channel, .. }
+        | FromHost::Spawned { channel, .. }
+        | FromHost::SpawnFailed { channel, .. }
+        | FromHost::Exited { channel, .. }
+        | FromHost::Replay { channel, .. }
+        | FromHost::Snapshot { channel, .. }
+        | FromHost::Desync { channel, .. }
+        | FromHost::Gone { channel, .. } => Some(*channel),
+        FromHost::Welcome { .. } | FromHost::ExecResult { .. } => None,
+    }
+}
+
+/// Run the writer until the daemon stops.
+///
+/// Frames are taken under the lock and written outside it, so a blocked socket never
+/// holds up the readers that are enqueuing.
+fn run_outbox(out: SharedOut) {
+    loop {
+        let (batch, writer_present) = {
+            let Ok(mut inner) = out.inner.lock() else {
+                return;
+            };
+            loop {
+                if inner.stop {
+                    return;
+                }
+                if inner.writer.is_some() && (!inner.control.is_empty() || inner.has_channel_work())
+                {
+                    break;
+                }
+                let Ok(next) = out.ready.wait(inner) else {
+                    return;
+                };
+                inner = next;
+            }
+            (inner.take_batch(), true)
+        };
+        if !writer_present || batch.is_empty() {
+            continue;
+        }
+
+        let mut failed = false;
+        {
+            let Ok(mut inner) = out.inner.lock() else {
+                return;
+            };
+            if let Some(writer) = inner.writer.as_mut() {
+                for message in &batch {
+                    if write_frame(writer, message).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if !failed && writer.flush().is_err() {
+                    failed = true;
+                }
+            }
+            if failed {
+                // The client vanished mid-write. Detach so later output is discarded
+                // cheaply instead of retrying into a dead pipe on every frame.
+                inner.writer = None;
+                inner.control.clear();
+                inner.channels.clear();
+            }
+            if inner.control.is_empty() && !inner.has_channel_work() {
+                out.drained.notify_all();
+            }
+        }
+    }
+}
+
+impl OutboxInner {
+    fn has_channel_work(&self) -> bool {
+        self.channels.values().any(|queue| !queue.is_empty())
+    }
+
+    /// One pass: all control frames, then at most one frame per channel, resuming
+    /// after wherever the last pass stopped.
+    ///
+    /// One frame each rather than draining a channel dry is the whole point — draining
+    /// would let a flooding pane keep the writer to itself for as long as it can
+    /// produce.
+    fn take_batch(&mut self) -> Vec<FromHost> {
+        let mut batch: Vec<FromHost> = self.control.drain(..).collect();
+
+        let ids: Vec<ChannelId> = self.channels.keys().copied().collect();
+        let start = ids.iter().position(|id| *id >= self.cursor).unwrap_or(0);
+        for step in 0..ids.len() {
+            let id = ids[(start + step) % ids.len()];
+            if let Some(queue) = self.channels.get_mut(&id) {
+                if let Some(message) = queue.pop_front() {
+                    batch.push(message);
+                }
+            }
+        }
+        if let Some(last) = ids.last() {
+            self.cursor = self.cursor.wrapping_add(1).min(last.wrapping_add(1));
+        }
+        self.channels.retain(|_, queue| !queue.is_empty());
+        batch
+    }
+}
 
 /// Everything the daemon owns, independent of any one client.
 ///
@@ -364,7 +592,12 @@ fn mint_host_epoch() -> u64 {
 
 impl Daemon {
     fn new() -> Self {
-        let out: SharedOut = Arc::new(Mutex::new(None));
+        let out: SharedOut = Outbox::new();
+        // One writer for the whole daemon, so no reader ever touches the socket.
+        {
+            let out = Arc::clone(&out);
+            std::thread::spawn(move || run_outbox(out));
+        }
         let channels: Arc<Mutex<HashMap<ChannelId, Channel>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -376,6 +609,17 @@ impl Daemon {
             let channels = Arc::clone(&channels);
             std::thread::spawn(move || {
                 while let Ok((channel, status)) = exit_rx.recv() {
+                    // Reported once, where it is attributable: a pane that outran the
+                    // client is a fact about that pane, and without naming it the only
+                    // symptom is a truncation marker with no cause.
+                    let dropped = out.dropped_bytes(channel);
+                    if dropped > 0 {
+                        tracing::info!(
+                            channel,
+                            dropped,
+                            "pane produced output faster than the client read it"
+                        );
+                    }
                     channels.lock().ok().map(|mut map| map.remove(&channel));
                     send(&out, &FromHost::Exited { channel, status });
                 }
@@ -414,6 +658,9 @@ pub fn serve<R: Read>(input: R, output: Box<dyn Write + Send>) -> std::io::Resul
     for channel in ids {
         shutdown_channel(&daemon.channels, channel);
     }
+    // One-shot: nothing else will be written, so stop the writer rather than leave it
+    // parked on a condvar for the life of the process.
+    daemon.out.shutdown();
     Ok(())
 }
 
@@ -423,9 +670,7 @@ fn serve_client<R: Read>(
     mut input: R,
     output: Box<dyn Write + Send>,
 ) -> std::io::Result<()> {
-    if let Ok(mut guard) = daemon.out.lock() {
-        *guard = Some(output);
-    }
+    daemon.out.install(output);
     let out = &daemon.out;
     let channels = &daemon.channels;
     let exit_tx = &daemon.exit_tx;
@@ -464,9 +709,12 @@ fn serve_client<R: Read>(
     // Deliberately does NOT tear down channels: the client going away is the
     // normal case — a closed laptop, a dropped link — and killing the agents then
     // is exactly the failure this daemon exists to prevent.
-    if let Ok(mut guard) = daemon.out.lock() {
-        *guard = None;
-    }
+    // Anything still queued is the last thing this client will hear — a refusal after
+    // a version mismatch is exactly that — so let the writer finish before the socket
+    // goes. Bounded, because a client that has already vanished must not hold the
+    // daemon up.
+    daemon.out.drain(std::time::Duration::from_secs(2));
+    daemon.out.detach();
 
     // Every surviving channel must be re-attached before its output resumes. The
     // next client does not know where these panes got to, so a live frame sent
@@ -845,18 +1093,52 @@ fn shutdown_channel(channels: &Arc<Mutex<HashMap<ChannelId, Channel>>>, channel:
 }
 
 fn send(out: &SharedOut, message: &FromHost) {
-    let Ok(mut guard) = out.lock() else {
+    let Ok(mut inner) = out.inner.lock() else {
         return;
     };
-    let Some(writer) = guard.as_mut() else {
-        // Nobody attached. Dropping this is deliberate — see SharedOut.
+    if inner.writer.is_none() {
+        // Nobody attached. Dropping is deliberate — the log holds it, and queueing for
+        // an absent client without bound is how a daemon gets OOM-killed.
         return;
-    };
-    if write_frame(writer, message).is_err() || writer.flush().is_err() {
-        // The client vanished mid-write. Detach it so later output is discarded
-        // cheaply instead of retrying into a dead pipe on every frame.
-        *guard = None;
     }
+
+    match frame_channel(message) {
+        None => inner.control.push_back(message.clone()),
+        Some(channel) => {
+            let queue = inner.channels.entry(channel).or_default();
+            if queue.len() >= MAX_QUEUED_FRAMES_PER_CHANNEL {
+                // Only output is droppable, and the OLDEST is what goes: on a terminal
+                // the newest frame is the one worth having, and stale queued output is
+                // exactly what the client no longer needs. Anything else — a resume
+                // answer, an exit — must not be dropped at all, so a full queue for
+                // those grows rather than loses them.
+                if matches!(message, FromHost::Data { .. }) {
+                    let mut freed = 0u64;
+                    while queue.len() >= MAX_QUEUED_FRAMES_PER_CHANNEL {
+                        match queue.pop_front() {
+                            Some(FromHost::Data { bytes, .. }) => freed += bytes.len() as u64,
+                            // Reached something undroppable; stop rather than lose it.
+                            Some(other) => {
+                                queue.push_front(other);
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                    if freed > 0 {
+                        *inner.dropped.entry(channel).or_default() += freed;
+                    }
+                }
+            }
+            inner
+                .channels
+                .entry(channel)
+                .or_default()
+                .push_back(message.clone());
+        }
+    }
+    drop(inner);
+    out.ready.notify_all();
 }
 
 fn poisoned() -> std::io::Error {
@@ -1193,6 +1475,109 @@ mod output_log_tests {
             capacity: spool_capacity,
         });
         log
+    }
+
+    fn data(channel: ChannelId, from: u64, len: usize) -> FromHost {
+        FromHost::Data {
+            channel,
+            from,
+            bytes: vec![b'x'; len],
+        }
+    }
+
+    /// An outbox with a writer installed, so `send` queues instead of discarding.
+    fn attached_outbox() -> SharedOut {
+        let out = Outbox::new();
+        out.install(Box::new(std::io::sink()));
+        out
+    }
+
+    #[test]
+    fn one_flooding_channel_cannot_starve_the_others() {
+        // The bug this exists for. Writing from each reader meant a slow client blocked
+        // one pane's thread while it held the shared writer, stalling every other pane
+        // — twenty agents, one streaming a build log, nineteen frozen.
+        let out = attached_outbox();
+        for index in 0..MAX_QUEUED_FRAMES_PER_CHANNEL {
+            send(&out, &data(1, index as u64, 8));
+        }
+        send(&out, &data(2, 0, 8));
+        send(&out, &data(3, 0, 8));
+
+        let mut inner = out.inner.lock().unwrap();
+        let batch = inner.take_batch();
+        let served: Vec<ChannelId> = batch.iter().filter_map(frame_channel).collect();
+
+        // One pass serves each waiting channel once, not one channel repeatedly.
+        assert!(served.contains(&2), "quiet channel starved: {served:?}");
+        assert!(served.contains(&3), "quiet channel starved: {served:?}");
+        assert_eq!(
+            served.iter().filter(|id| **id == 1).count(),
+            1,
+            "the flooding channel took more than its turn: {served:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_oldest_output_and_counts_it() {
+        // On a terminal the newest frame is the one worth having, so a pane that
+        // outruns the client loses its stale output rather than its current screen.
+        // Safe only because the log still holds every byte: the client sees a gap,
+        // marks it, and the next attach replays or snapshots.
+        let out = attached_outbox();
+        for index in 0..(MAX_QUEUED_FRAMES_PER_CHANNEL + 10) {
+            send(&out, &data(1, index as u64 * 8, 8));
+        }
+
+        let inner = out.inner.lock().unwrap();
+        assert_eq!(
+            inner.channels.get(&1).map(|queue| queue.len()),
+            Some(MAX_QUEUED_FRAMES_PER_CHANNEL),
+            "the queue must stay bounded"
+        );
+        // The newest frame survived; the oldest did not.
+        let last = inner.channels.get(&1).and_then(|queue| queue.back());
+        assert!(
+            matches!(last, Some(FromHost::Data { from, .. }) if *from == (MAX_QUEUED_FRAMES_PER_CHANNEL as u64 + 9) * 8),
+            "the newest frame must be kept"
+        );
+        drop(inner);
+        assert_eq!(
+            out.dropped_bytes(1),
+            80,
+            "dropped bytes must be attributable"
+        );
+    }
+
+    #[test]
+    fn a_resume_answer_is_never_dropped_to_make_room() {
+        // Output can be lost and recovered; a Replay cannot. Dropping one would leave
+        // the client waiting for an answer that never comes, on a pane the host knows
+        // perfectly well how to resume.
+        let out = attached_outbox();
+        send(
+            &out,
+            &FromHost::Replay {
+                channel: 1,
+                from: 0,
+                bytes: vec![b'r'; 4],
+            },
+        );
+        for index in 0..(MAX_QUEUED_FRAMES_PER_CHANNEL * 2) {
+            send(&out, &data(1, index as u64 * 8, 8));
+        }
+
+        let inner = out.inner.lock().unwrap();
+        let queue = inner.channels.get(&1).expect("queue");
+        assert!(
+            queue
+                .iter()
+                .any(|message| matches!(message, FromHost::Replay { .. })),
+            "the resume answer must survive a flood"
+        );
+        // And it is still in front of the output that follows it, or the client would
+        // read that output as a gap.
+        assert!(matches!(queue.front(), Some(FromHost::Replay { .. })));
     }
 
     #[test]
