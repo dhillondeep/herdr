@@ -344,6 +344,144 @@ fn the_attach_bridge_delivers_the_handshake_without_waiting_for_the_stream_to_en
 }
 
 #[test]
+fn exec_answers_with_what_the_command_printed() {
+    // The transport behind remote git. Facts about the machine the work is on have to
+    // be asked of that machine: answering them locally is not merely unavailable but
+    // wrong, since a path that happens to exist here describes a different repository.
+    let socket = scratch("exec-basic");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 1,
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf hello; printf oops >&2".into(),
+            ],
+            cwd: None,
+        },
+    )
+    .expect("exec");
+
+    match client::read::<_, FromHost>(&mut stream).expect("result") {
+        FromHost::ExecResult {
+            id,
+            code,
+            stdout,
+            stderr,
+        } => {
+            assert_eq!(id, 1);
+            assert_eq!(code, Some(0));
+            assert_eq!(stdout, b"hello");
+            // Both streams, kept apart: git writes diagnostics to stderr and folding
+            // them into stdout would corrupt the value being parsed.
+            assert_eq!(stderr, b"oops");
+        }
+        other => panic!("expected ExecResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn exec_answers_even_when_the_command_cannot_run() {
+    // Silence would park the caller until its deadline, and the caller is a background
+    // poller — one unanswerable command per refresh would accumulate stuck threads.
+    let socket = scratch("exec-missing");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 7,
+            argv: vec!["definitely-not-a-real-binary-xyz".into()],
+            cwd: None,
+        },
+    )
+    .expect("exec");
+
+    match client::read::<_, FromHost>(&mut stream).expect("result") {
+        FromHost::ExecResult {
+            id, code, stderr, ..
+        } => {
+            assert_eq!(id, 7);
+            assert_eq!(code, None, "a command that never ran has no exit code");
+            assert!(!stderr.is_empty(), "the reason must come back");
+        }
+        other => panic!("expected ExecResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn exec_runs_where_it_was_told_to() {
+    // The working directory is the whole question for `git -C`: answering from the
+    // wrong one is how a remote workspace ends up reporting another repository.
+    let socket = scratch("exec-cwd");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 2,
+            argv: vec!["pwd".into()],
+            cwd: Some("/".into()),
+        },
+    )
+    .expect("exec");
+
+    match client::read::<_, FromHost>(&mut stream).expect("result") {
+        FromHost::ExecResult { stdout, .. } => {
+            assert_eq!(String::from_utf8_lossy(&stdout).trim(), "/");
+        }
+        other => panic!("expected ExecResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_slow_exec_does_not_stall_other_traffic() {
+    // Execs run on their own thread. The read loop carries every pane's input, so a
+    // git command on a cold repository blocking it would freeze typing on that host.
+    let socket = scratch("exec-concurrent");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 1,
+            argv: vec!["sh".into(), "-c".into(), "sleep 2; printf slow".into()],
+            cwd: None,
+        },
+    )
+    .expect("slow exec");
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 2,
+            argv: vec!["printf".into(), "fast".into()],
+            cwd: None,
+        },
+    )
+    .expect("fast exec");
+
+    // The fast one must come back first, which it cannot if the slow one is holding
+    // the read loop.
+    match client::read::<_, FromHost>(&mut stream).expect("first result") {
+        FromHost::ExecResult { id, stdout, .. } => {
+            assert_eq!(
+                id, 2,
+                "the quick command should not wait behind the slow one"
+            );
+            assert_eq!(stdout, b"fast");
+        }
+        other => panic!("expected ExecResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_process_outlives_the_client_that_asked_for_it() {
     let socket = scratch("sock");
     let heartbeat = scratch("beat");
