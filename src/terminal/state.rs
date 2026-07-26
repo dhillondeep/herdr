@@ -151,6 +151,9 @@ pub struct TerminalState {
     /// Sticky, and never set for a local pane. Distinct from a process exiting: the
     /// work did not finish, it was lost, and the two must not be presented alike.
     pub host_stopped: bool,
+    /// The agent is stuck on something no keystroke in this pane will clear — a usage
+    /// limit, a quota, an expired credential.
+    pub fault: bool,
     pub last_agent_state_change_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
@@ -186,6 +189,7 @@ impl TerminalState {
             state: AgentState::Unknown,
             blocker: crate::detect::BlockerKind::Unknown,
             host_stopped: false,
+            fault: false,
             last_agent_state_change_seq: None,
             revision: 0,
             launch_argv: None,
@@ -2161,6 +2165,7 @@ mod tests {
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            fault: false,
             blocker: crate::detect::BlockerKind::Unknown,
         };
 

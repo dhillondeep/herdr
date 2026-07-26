@@ -39,6 +39,13 @@ pub struct AgentDetection {
     /// What kind of attention a blocked agent needs, read from the rule that
     /// matched.
     ///
+    /// The agent cannot continue without something a person must do elsewhere — a
+    /// usage limit, a quota, an expired credential.
+    ///
+    /// Deliberately independent of `state`: the screens that mean this often *look*
+    /// idle, which is exactly why it needs its own signal. Treating it as idle is how
+    /// a rate-limited agent fires a "finished" notification and quietly costs a night.
+    pub fault: bool,
     /// Only meaningful while `state` is `Blocked`; `Unknown` otherwise, and
     /// `Unknown` also when the matched rule does not say. It is carried on the
     /// detection rather than recomputed later because the rule that produced the
@@ -334,6 +341,7 @@ pub fn detect_agent_with_osc(
             visible_idle: false,
             visible_blocker: false,
             visible_working: false,
+            fault: false,
             blocker: BlockerKind::Unknown,
         };
     };
@@ -1408,6 +1416,30 @@ mod blocker_kind_tests {
                 "{state:?} must not carry a blocker kind"
             );
         }
+    }
+
+    #[test]
+    fn a_fault_is_carried_independently_of_the_state() {
+        // Not scoped to Blocked, unlike the blocker kind. A quota screen usually
+        // reports Idle, and scoping it would discard the signal exactly when it
+        // matters.
+        let detection = crate::detect::manifest::detect_for_test_with_fault(
+            AgentState::Idle,
+            Some("usage_limit"),
+            true,
+        );
+        assert!(detection.fault);
+        assert_eq!(detection.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn a_rule_that_does_not_claim_a_fault_does_not_produce_one() {
+        let detection = crate::detect::manifest::detect_for_test_with_fault(
+            AgentState::Idle,
+            Some("idle_hints"),
+            false,
+        );
+        assert!(!detection.fault);
     }
 
     #[test]

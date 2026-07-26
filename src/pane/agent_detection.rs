@@ -216,6 +216,7 @@ pub(super) enum DetectionPublishDecision {
     Publish {
         state: AgentState,
         blocker: crate::detect::BlockerKind,
+        fault: bool,
         visible_idle: bool,
         visible_blocker: bool,
         visible_working: bool,
@@ -279,6 +280,9 @@ pub(super) fn decide_screen_detection_publish(
         DetectionTransitionDecision::NoPublish => DetectionPublishDecision::NoPublish,
         DetectionTransitionDecision::PublishNext => DetectionPublishDecision::Publish {
             state: new_state,
+            // Carried straight through: unlike the blocker kind this is not scoped to a
+            // state, because the screens that mean it usually look idle.
+            fault: detection.fault,
             // Taken from the detection that produced this publish, and only when the
             // published state really is blocked: the stabiliser can turn a blocked
             // detection into something else, and carrying the kind across that would
@@ -319,7 +323,8 @@ pub(super) fn detection_update_for_publish_with_osc(
             visible_idle: true,
             visible_blocker: false,
             visible_working: false,
-            // A finished process is not blocked on anything.
+            // A finished process is neither blocked nor stuck on a quota.
+            fault: false,
             blocker: crate::detect::BlockerKind::Unknown,
         });
     }
@@ -358,6 +363,7 @@ mod tests {
             visible_idle: state == AgentState::Idle,
             visible_blocker: false,
             visible_working: state == AgentState::Working,
+            fault: false,
             blocker: crate::detect::BlockerKind::Unknown,
         }
     }
@@ -516,6 +522,7 @@ mod tests {
             ),
             DetectionPublishDecision::Publish {
                 state: AgentState::Working,
+                fault: false,
                 blocker: crate::detect::BlockerKind::Unknown,
                 visible_idle: false,
                 visible_blocker: false,
@@ -537,6 +544,7 @@ mod tests {
             ),
             DetectionPublishDecision::Publish {
                 state: AgentState::Idle,
+                fault: false,
                 blocker: crate::detect::BlockerKind::Unknown,
                 visible_idle: true,
                 visible_blocker: false,

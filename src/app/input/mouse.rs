@@ -2645,6 +2645,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 blocker: crate::detect::BlockerKind::Unknown,
+                fault: false,
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: false,

@@ -2683,6 +2683,7 @@ impl AppState {
                 agent,
                 state,
                 blocker,
+                fault,
                 visible_blocker,
                 visible_working,
                 process_exited,
@@ -2708,6 +2709,9 @@ impl AppState {
                     } else {
                         crate::detect::BlockerKind::Unknown
                     };
+                    // Not scoped to a state: a quota screen usually reads as idle, and
+                    // that is exactly why it needs saying separately.
+                    terminal.fault = fault;
                     Some(mutation)
                 })
                 .into_iter()
@@ -3027,10 +3031,20 @@ impl AppState {
         let suppress_active_tab_notifications =
             active_tab_suppresses_notifications(is_active_tab, self.outer_terminal_focus);
 
-        let client_notification_kind = notification_toast_for_effective_state_change(
-            suppress_active_tab_notifications,
-            change,
-        );
+        // A faulted agent must never be announced as finished. The screens that mean
+        // "out of quota" read as idle, so without this the notification says the work
+        // is done at the exact moment it has silently stopped — the single most
+        // expensive wrong message herdr can send, because it stops you looking.
+        let faulted = self
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .and_then(|id| self.terminals.get(&id))
+            .is_some_and(|terminal| terminal.fault || terminal.host_stopped);
+
+        let client_notification_kind = if faulted {
+            Some(ToastKind::NeedsAttention)
+        } else {
+            notification_toast_for_effective_state_change(suppress_active_tab_notifications, change)
+        };
         let sound = notification_sound_for_effective_state_change(
             suppress_active_tab_notifications,
             change,
@@ -3046,6 +3060,8 @@ impl AppState {
         let known_agent = change.known_agent.or(change.previous_known_agent);
         let kind = client_notification_kind.unwrap_or(match sound {
             Some(crate::sound::Sound::Request) => ToastKind::NeedsAttention,
+            // Falling back to `Finished` is right for a real completion and wrong for
+            // a fault, which is why the fault case is decided above rather than here.
             Some(crate::sound::Sound::Done) | None => ToastKind::Finished,
         });
         let workspace_id = self.workspaces[ws_idx].id.clone();
@@ -4652,6 +4668,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Permission,
+            fault: false,
             visible_blocker: true,
             visible_working: false,
             process_exited: false,
@@ -4683,6 +4700,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Question,
+            fault: false,
             visible_blocker: true,
             visible_working: false,
             process_exited: false,
@@ -4693,6 +4711,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             blocker: crate::detect::BlockerKind::Question,
+            fault: false,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
@@ -4723,6 +4742,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4762,6 +4782,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4796,6 +4817,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4819,6 +4841,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4841,6 +4864,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Unknown,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4851,6 +4875,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4897,6 +4922,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4907,6 +4933,56 @@ mod tests {
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
         assert_eq!(toast.title, "pi needs attention");
         assert_eq!(toast.context, "background · 2");
+    }
+
+    #[test]
+    fn a_faulted_agent_is_never_announced_as_finished() {
+        // The most expensive wrong message herdr can send. A usage-limit screen reads
+        // as idle, so the ordinary path calls that a completion and tells you the work
+        // is done at the exact moment it silently stopped — and being told it finished
+        // is what stops you going to look.
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.toast_config.delivery = crate::config::ToastDelivery::Herdr;
+        let bg_pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+
+        // Working first, so settling to Idle is a completion transition.
+        let now = std::time::Instant::now();
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Working,
+            blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
+            visible_blocker: false,
+            visible_working: true,
+            process_exited: false,
+            observed_at: now,
+        });
+        state.toast = None;
+
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id: bg_pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            blocker: crate::detect::BlockerKind::Unknown,
+            // The rule that matched says this screen is a fault, not an ending.
+            fault: true,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: now + std::time::Duration::from_secs(1),
+        });
+
+        let toast = state
+            .toast
+            .as_ref()
+            .expect("a faulted agent must still be announced");
+        assert_eq!(
+            toast.kind,
+            ToastKind::NeedsAttention,
+            "a fault must not be reported as a completion"
+        );
     }
 
     #[test]
@@ -4922,6 +4998,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4955,6 +5032,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -4967,6 +5045,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
@@ -4991,6 +5070,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5017,6 +5097,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5045,6 +5126,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5101,6 +5183,7 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5120,6 +5203,7 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: true,
             visible_working: false,
             process_exited: false,
@@ -5151,6 +5235,7 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Working,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5175,6 +5260,7 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5202,6 +5288,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: true,
             process_exited: false,
@@ -5263,6 +5350,7 @@ mod tests {
             agent: Some(Agent::Devin),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5396,6 +5484,7 @@ mod tests {
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5426,6 +5515,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5453,6 +5543,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5477,6 +5568,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,
@@ -5499,6 +5591,7 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             blocker: crate::detect::BlockerKind::Unknown,
+            fault: false,
             visible_blocker: false,
             visible_working: false,
             process_exited: false,

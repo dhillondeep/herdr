@@ -28,6 +28,8 @@ pub struct DetectionInput<'a> {
 pub struct DetectionExplain {
     pub agent: Option<String>,
     pub state: AgentState,
+    /// The matched rule says the agent is stuck on something outside the pane.
+    pub fault: bool,
     pub source: Option<ManifestSource>,
     pub matched_rule: Option<MatchedRule>,
     pub screen_detection_skipped: bool,
@@ -178,6 +180,20 @@ struct ManifestRule {
     visible_working: bool,
     #[serde(default)]
     skip_state_update: bool,
+    /// This rule matches a screen the agent cannot get past on its own — a usage
+    /// limit, a quota, an expired credential.
+    ///
+    /// Distinct from `blocked`, which means waiting for an answer that can be given in
+    /// the pane. A fault cannot be cleared by typing: the work has stopped and stays
+    /// stopped. The failure mode without this is the worst kind — a rate-limited agent
+    /// reads as idle, fires a cheerful "finished" notification, and silently costs
+    /// hours that nobody is watching for.
+    ///
+    /// No bundled manifest sets this yet. `AGENTS.md` requires screen-matching rules be
+    /// written against captured evidence and a rate-limit screen cannot be conjured on
+    /// demand, so this is the mechanism waiting for the rule.
+    #[serde(default)]
+    fault: bool,
     #[serde(default)]
     all: Vec<ManifestGate>,
     #[serde(default)]
@@ -373,6 +389,7 @@ pub fn explain_for_label(agent_label: &str, screen_content: &str) -> DetectionEx
         return DetectionExplain {
             agent: Some(agent_label.to_string()),
             state: AgentState::Unknown,
+            fault: false,
             source: None,
             matched_rule: None,
             screen_detection_skipped: false,
@@ -418,10 +435,22 @@ pub fn should_skip_state_update(agent: Agent, screen_content: &str) -> bool {
 /// what matches, and going through real screen content would test the manifests
 /// instead.
 #[cfg(test)]
-pub(crate) fn detect_for_test(state: AgentState, matched_rule_id: Option<&str>) -> AgentDetection {
+pub(crate) fn detect_for_test_with_fault(
+    state: AgentState,
+    matched_rule_id: Option<&str>,
+    fault: bool,
+) -> AgentDetection {
+    let mut explain = explain_for_test(state, matched_rule_id);
+    explain.fault = fault;
+    explain.into_detection()
+}
+
+#[cfg(test)]
+fn explain_for_test(state: AgentState, matched_rule_id: Option<&str>) -> DetectionExplain {
     DetectionExplain {
         agent: None,
         state,
+        fault: false,
         source: None,
         matched_rule: matched_rule_id.map(|id| MatchedRule {
             id: id.to_string(),
@@ -444,7 +473,11 @@ pub(crate) fn detect_for_test(state: AgentState, matched_rule_id: Option<&str>) 
         remote_update_status: None,
         remote_update_error: None,
     }
-    .into_detection()
+}
+
+#[cfg(test)]
+pub(crate) fn detect_for_test(state: AgentState, matched_rule_id: Option<&str>) -> AgentDetection {
+    explain_for_test(state, matched_rule_id).into_detection()
 }
 
 impl DetectionExplain {
@@ -455,6 +488,7 @@ impl DetectionExplain {
             visible_idle: self.visible_idle,
             visible_blocker: self.visible_blocker,
             visible_working: self.visible_working,
+            fault: self.fault,
             // Only classify an actual blocker. A rule id that happens to contain
             // "permission" on an idle screen would otherwise label a pane as needing
             // a decision it is not waiting for.
@@ -527,6 +561,10 @@ fn evaluate_loaded_manifest(
     DetectionExplain {
         agent: Some(agent_label(agent).to_string()),
         state,
+        // From the rule that matched. Independent of `state` on purpose: the screens
+        // that mean "stuck on a quota" usually look idle, which is the whole reason a
+        // separate signal is needed rather than another state.
+        fault: rule.fault,
         source: Some(loaded.source),
         matched_rule: Some(MatchedRule {
             id: rule.id.clone(),
@@ -589,6 +627,7 @@ fn fallback_explain(
         } else {
             AgentState::Unknown
         },
+        fault: false,
         source,
         matched_rule: None,
         screen_detection_skipped: false,

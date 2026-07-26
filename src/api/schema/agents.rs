@@ -250,6 +250,10 @@ pub struct AgentInfo {
     /// when the rule that matched actually says which kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocker: Option<super::BlockerKind>,
+    /// The agent is stuck on something no keystroke in its pane will clear — a usage
+    /// limit, a quota, an expired credential. It is not working and will not resume.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub fault: bool,
     /// The machine this agent ran on went away. The work did not finish; it was lost.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub host_stopped: bool,

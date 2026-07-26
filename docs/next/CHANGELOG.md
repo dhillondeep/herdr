@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Agent detection can mark a screen as a *fault* — a usage limit, quota, or expired credential the agent cannot get past on its own. A faulted agent is never announced as finished, which previously turned a rate-limited agent into a cheerful "done" notification. No bundled manifest sets it yet; the rules need captured evidence.
+- Panes whose remote host restarted are kept and marked `host_stopped` instead of being closed, so the last screen and the reason survive.
 - `herdr attention wait` blocks until any agent on any machine wants attention, with `--status`, `--host`, and `--count`. `agent wait` takes a single target, so asking "tell me when anything needs me" previously required knowing which agent to watch.
 
 ### Changed

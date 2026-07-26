@@ -6113,6 +6113,10 @@
                 "null"
               ]
             },
+            "fault": {
+              "description": "The agent is stuck on something no keystroke in its pane will clear — a usage\nlimit, a quota, an expired credential. It is not working and will not resume.",
+              "type": "boolean"
+            },
             "focused": {
               "type": "boolean"
             },

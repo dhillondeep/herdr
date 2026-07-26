@@ -207,6 +207,7 @@ async fn publish_state_changed_event(
     agent: Option<Agent>,
     state: AgentState,
     blocker: crate::detect::BlockerKind,
+    fault: bool,
     visible_blocker: bool,
     visible_working: bool,
     process_exited: bool,
@@ -221,6 +222,7 @@ async fn publish_state_changed_event(
             agent,
             state,
             blocker,
+            fault,
             visible_blocker,
             visible_working,
             process_exited,
@@ -240,6 +242,7 @@ async fn publish_state_changed_event(
 struct AgentDetectionPublishUpdate {
     state: AgentState,
     blocker: crate::detect::BlockerKind,
+    fault: bool,
     visible_idle: bool,
     visible_blocker: bool,
     visible_working: bool,
@@ -277,6 +280,7 @@ async fn apply_agent_detection_publish_update(
         agent,
         update.state,
         update.blocker,
+        update.fault,
         update.visible_blocker,
         update.visible_working,
         update.process_exited,
@@ -814,6 +818,7 @@ fn spawn_basic_detection_task(
                                 false,
                                 false,
                                 false,
+                                false,
                                 now,
                             )
                             .await;
@@ -915,6 +920,7 @@ fn spawn_basic_detection_task(
                 DetectionPublishDecision::Publish {
                     state: new_state,
                     blocker,
+                    fault,
                     visible_idle,
                     visible_blocker,
                     visible_working,
@@ -927,6 +933,7 @@ fn spawn_basic_detection_task(
                         AgentDetectionPublishUpdate {
                             state: new_state,
                             blocker,
+                            fault,
                             visible_idle,
                             visible_blocker,
                             visible_working,
@@ -2561,6 +2568,7 @@ impl PaneRuntime {
                                             false,
                                             false,
                                             false,
+                                            false,
                                             now,
                                         )
                                         .await;
@@ -2691,6 +2699,7 @@ impl PaneRuntime {
                         DetectionPublishDecision::Publish {
                             state: new_state,
                             blocker,
+                            fault,
                             visible_idle,
                             visible_blocker,
                             visible_working,
@@ -2703,6 +2712,7 @@ impl PaneRuntime {
                                 AgentDetectionPublishUpdate {
                                     state: new_state,
                                     blocker,
+                                    fault,
                                     visible_idle,
                                     visible_blocker,
                                     visible_working,
@@ -4619,6 +4629,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             std::time::Instant::now(),
         );
         tokio::pin!(publish);
@@ -4655,6 +4666,7 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 blocker: crate::detect::BlockerKind::Unknown,
+                fault: false,
                 visible_blocker: false,
                 visible_working: false,
                 process_exited: false,

@@ -634,7 +634,7 @@ fn agent_demand_class(agent: &crate::api::schema::AgentInfo) -> (u8, u8) {
     };
     // `seen` is not carried on AgentInfo; a finished agent surfaced by a wait is by
     // definition one the caller has not looked at yet.
-    match crate::attention::demand_class(state, blocker, false, agent.host_stopped) {
+    match crate::attention::demand_class(state, blocker, false, agent.fault, agent.host_stopped) {
         Some(class) => (0, class as u8),
         None => (1, 0),
     }
@@ -976,6 +976,7 @@ mod attention_tests {
             display_agent: None,
             agent_status: status,
             blocker: None,
+            fault: false,
             host_stopped: false,
             screen_detection_skipped: false,
             state_labels: Default::default(),

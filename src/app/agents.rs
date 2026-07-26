@@ -387,6 +387,7 @@ impl App {
             blocker: (pane.agent_status == crate::api::schema::AgentStatus::Blocked
                 && terminal.blocker != crate::detect::BlockerKind::Unknown)
                 .then(|| crate::api::schema::BlockerKind::from(terminal.blocker)),
+            fault: terminal.fault,
             host_stopped: terminal.host_stopped,
             screen_detection_skipped: terminal.full_lifecycle_hook_authority_active(),
             state_labels: pane.state_labels,

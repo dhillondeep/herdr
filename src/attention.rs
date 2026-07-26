@@ -50,9 +50,13 @@ pub fn demand_class(
     state: AgentState,
     blocker: BlockerKind,
     seen: bool,
+    fault: bool,
     host_stopped: bool,
 ) -> Option<DemandClass> {
-    if host_stopped {
+    // Both outrank the agent's own reported state, and for the same reason: a stuck or
+    // lost agent frequently *looks* idle, so trusting the state would file it with the
+    // work that finished.
+    if fault || host_stopped {
         return Some(DemandClass::Fault);
     }
     match state {
@@ -101,8 +105,19 @@ mod demand_tests {
         // The reason this exists at all. Twenty blocked agents are unworkable if you
         // cannot tell which ones you could clear on the way past.
         assert!(
-            demand_class(AgentState::Blocked, BlockerKind::Permission, false, false)
-                < demand_class(AgentState::Blocked, BlockerKind::Question, false, false)
+            demand_class(
+                AgentState::Blocked,
+                BlockerKind::Permission,
+                false,
+                false,
+                false
+            ) < demand_class(
+                AgentState::Blocked,
+                BlockerKind::Question,
+                false,
+                false,
+                false
+            )
         );
     }
 
@@ -117,9 +132,29 @@ mod demand_tests {
             AgentState::Unknown,
         ] {
             assert_eq!(
-                demand_class(state, BlockerKind::Unknown, true, true),
+                demand_class(state, BlockerKind::Unknown, true, false, true),
                 Some(DemandClass::Fault),
                 "{state:?} on a stopped host must rank as a fault"
+            );
+        }
+        assert!(Some(DemandClass::Fault) < Some(DemandClass::BlockedDecision));
+    }
+
+    #[test]
+    fn a_fault_outranks_everything_and_ignores_the_reported_state() {
+        // The screens that mean "out of quota" read as idle. Trusting the state would
+        // file a stopped agent with the ones that finished, which is how hours go
+        // missing without anybody looking.
+        for state in [
+            AgentState::Idle,
+            AgentState::Working,
+            AgentState::Blocked,
+            AgentState::Unknown,
+        ] {
+            assert_eq!(
+                demand_class(state, BlockerKind::Unknown, false, true, false),
+                Some(DemandClass::Fault),
+                "{state:?} with a fault must rank as a fault"
             );
         }
         assert!(Some(DemandClass::Fault) < Some(DemandClass::BlockedDecision));
@@ -129,7 +164,13 @@ mod demand_tests {
     fn working_is_not_a_demand() {
         // It is not waiting for anybody, and queueing it would bury the ones that are.
         assert_eq!(
-            demand_class(AgentState::Working, BlockerKind::Unknown, false, false),
+            demand_class(
+                AgentState::Working,
+                BlockerKind::Unknown,
+                false,
+                false,
+                false
+            ),
             None
         );
     }
@@ -137,11 +178,11 @@ mod demand_tests {
     #[test]
     fn a_finished_agent_stops_being_a_demand_once_it_has_been_seen() {
         assert_eq!(
-            demand_class(AgentState::Idle, BlockerKind::Unknown, false, false),
+            demand_class(AgentState::Idle, BlockerKind::Unknown, false, false, false),
             Some(DemandClass::Done)
         );
         assert_eq!(
-            demand_class(AgentState::Idle, BlockerKind::Unknown, true, false),
+            demand_class(AgentState::Idle, BlockerKind::Unknown, true, false, false),
             None
         );
     }
@@ -151,8 +192,19 @@ mod demand_tests {
         // Guessing it into `permission` would send someone to a question expecting a
         // keystroke, which costs exactly the attention this ordering protects.
         assert!(
-            demand_class(AgentState::Blocked, BlockerKind::Question, false, false)
-                < demand_class(AgentState::Blocked, BlockerKind::Unknown, false, false)
+            demand_class(
+                AgentState::Blocked,
+                BlockerKind::Question,
+                false,
+                false,
+                false
+            ) < demand_class(
+                AgentState::Blocked,
+                BlockerKind::Unknown,
+                false,
+                false,
+                false
+            )
         );
     }
 }
