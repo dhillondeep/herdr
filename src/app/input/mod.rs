@@ -101,9 +101,7 @@ impl App {
                     self.handle_rename_key_via_api(key_event)
                 }
                 Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
-                Mode::PickHost => {
-                    super::input::modal::handle_host_pick_key(&mut self.state, key_event.code)
-                }
+                Mode::PickHost => self.handle_host_pick_key(key_event),
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
@@ -144,6 +142,22 @@ impl App {
             {
                 let _ = rt.send_paste(text).await;
             }
+        }
+    }
+
+    /// Host picker keys, plus the step that follows.
+    ///
+    /// Picking a machine is the whole answer when the name prompt is off, which is the
+    /// default. Leaving the rename dialog up afterwards would demand a name the user has
+    /// explicitly said they do not want to be asked for — so the pre-filled name is
+    /// confirmed through the ordinary path rather than by duplicating creation here.
+    pub(crate) fn handle_host_pick_key(&mut self, key_event: crossterm::event::KeyEvent) {
+        super::input::modal::handle_host_pick_key(&mut self.state, key_event.code);
+        if self.state.mode == Mode::RenameWorkspace && !self.state.prompt_new_workspace_name {
+            self.handle_rename_key_via_api(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ));
         }
     }
 

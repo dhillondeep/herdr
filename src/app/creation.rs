@@ -94,19 +94,27 @@ impl App {
     }
 
     pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
-        if self.state.prompt_new_workspace_name {
+        // Retry discovery when there is nothing to offer. Getting an empty picker is
+        // exactly the moment the host list turns out to be wrong, and without this the
+        // only cure is restarting the server.
+        #[cfg(unix)]
+        if self.state.host_candidates.is_empty() {
+            self.start_host_discovery();
+        }
+
+        // Two different questions, and they were wrongly treated as one. Naming a
+        // workspace is a preference that defaults to OFF; choosing which machine it
+        // runs on only arises when there are machines, and cannot be inferred. Hanging
+        // the host picker off the name prompt made it unreachable for anyone using the
+        // default config — which is everyone who has not opted into being asked for a
+        // name.
+        let must_ask_where = !self.state.host_candidates.is_empty();
+        if self.state.prompt_new_workspace_name || must_ask_where {
             let follow_cwd = self.workspace_creation_source().and_then(|ws_idx| {
                 self.focused_pane_cwd_in_workspace(ws_idx)
                     .or_else(|| self.seed_cwd_from_workspace(ws_idx))
             });
             let cwd = self.resolve_new_terminal_cwd(follow_cwd);
-            // Retry discovery when there is nothing to offer. Getting an empty picker
-            // is exactly the moment the host list turns out to be wrong, and without
-            // this the only cure is restarting the server.
-            #[cfg(unix)]
-            if self.state.host_candidates.is_empty() {
-                self.start_host_discovery();
-            }
             super::input::open_new_workspace_dialog(&mut self.state, cwd);
             return;
         }
@@ -544,4 +552,61 @@ fn terminal_agent_session_info(
             kind: session.session_ref.kind,
             value: session.session_ref.value.clone(),
         })
+}
+
+#[cfg(test)]
+mod host_pick_gate_tests {
+    use crate::app::state::Mode;
+    use crate::app::App;
+    use crate::config::Config;
+
+    fn app_for_test() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn a_host() -> crate::host::discovery::HostCandidate {
+        crate::host::discovery::HostCandidate {
+            id: crate::host::HostId::parse("coder.box1").expect("host"),
+            origin: crate::host::discovery::HostOrigin::Discovered,
+        }
+    }
+
+    #[tokio::test]
+    async fn having_somewhere_else_to_run_asks_where_even_without_a_name_prompt() {
+        // The bug: naming a workspace is a preference that defaults to OFF, and choosing
+        // the machine is a separate question that only arises when there are machines.
+        // Hanging the second off the first made the picker unreachable on a default
+        // config — creating a workspace silently produced a local one, asking nothing.
+        let mut app = app_for_test();
+        app.state.prompt_new_workspace_name = false;
+        app.state.host_candidates = vec![a_host()];
+
+        app.begin_tui_workspace_create("test:create");
+
+        assert_eq!(
+            app.state.mode,
+            Mode::PickHost,
+            "with hosts available the picker must open regardless of the name preference"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_hosts_the_flow_is_untouched() {
+        // The other half: a picker listing only "Local" is a dialog every user would
+        // have to dismiss for nothing.
+        let mut app = app_for_test();
+        app.state.prompt_new_workspace_name = false;
+        app.state.host_candidates = Vec::new();
+
+        app.begin_tui_workspace_create("test:create");
+
+        assert_ne!(app.state.mode, Mode::PickHost);
+    }
 }
