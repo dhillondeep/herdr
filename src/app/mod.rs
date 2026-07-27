@@ -312,6 +312,22 @@ impl App {
     /// ssh handshake. That is a visible stall and should move to a background
     /// connect with the pane showing a connecting state; doing it here first keeps
     /// the change reviewable.
+    /// The connection a workspace's panes should use, opening one if needed.
+    ///
+    /// One place resolves this so a new spawn path cannot quietly forget: every pane in
+    /// a host-bound workspace has to land on that host, and each site that builds its own
+    /// shell config is another chance to spawn locally instead. That has happened three
+    /// times already — the root pane, splits, and new tabs each had to be fixed
+    /// separately.
+    #[cfg(unix)]
+    pub(crate) fn workspace_host_link(
+        &mut self,
+        ws_idx: usize,
+    ) -> Option<std::sync::Arc<crate::host::link::HostLink>> {
+        let host = self.state.workspaces.get(ws_idx)?.host.clone()?;
+        self.host_link(&host)
+    }
+
     /// The connection to `host` if one is already up, never opening a new one.
     ///
     /// Separate from `host_link` because background pollers must not dial: a status

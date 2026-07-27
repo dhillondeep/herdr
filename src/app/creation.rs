@@ -205,14 +205,32 @@ impl App {
             return self.create_workspace_with_options(initial_cwd, focus);
         };
         let (rows, cols) = self.state.estimate_pane_size();
+
+        // Resolved before the workspace is borrowed mutably, since opening a connection
+        // needs `&mut self`. A tab belongs to its workspace, so it runs where the
+        // workspace runs — a new tab quietly opening a local shell in a remote workspace
+        // is the same surprise as the root pane doing it.
+        #[cfg(unix)]
+        let host_link = self.workspace_host_link(ws_idx);
+
+        let scrollback = self.state.pane_scrollback_limit_bytes;
+        let theme = self.state.host_terminal_theme;
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        #[cfg(unix)]
+        if let Some(link) = host_link.as_ref() {
+            shell_config = shell_config.on_host(link);
+        }
+
         let ws = &mut self.state.workspaces[ws_idx];
         let (idx, terminal, runtime) = ws.create_tab(
             rows,
             cols,
             initial_cwd,
-            self.state.pane_scrollback_limit_bytes,
-            self.state.host_terminal_theme,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            scrollback,
+            theme,
+            shell_config,
             Vec::new(),
         )?;
         let root_pane = ws.tabs[idx].root_pane;

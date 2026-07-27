@@ -232,6 +232,24 @@ impl App {
             return false;
         };
 
+        // A resumed agent belongs to the same workspace, so it belongs on the same
+        // machine. Respawning it locally would silently move the work — and the resume
+        // path exists precisely for the case where the machine went away and came back.
+        #[cfg(unix)]
+        let host_link = {
+            // Two statements: the lookup borrows `self`, and resolving the link needs it
+            // mutably, so they cannot be chained.
+            let ws_idx = self.find_pane(pane_id).map(|(ws_idx, _)| ws_idx);
+            ws_idx.and_then(|ws_idx| self.workspace_host_link(ws_idx))
+        };
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        #[cfg(unix)]
+        if let Some(link) = host_link.as_ref() {
+            shell_config = shell_config.on_host(link);
+        }
+
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -239,7 +257,7 @@ impl App {
             cwd,
             self.state.pane_scrollback_limit_bytes,
             host_terminal_theme,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            shell_config,
             &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
