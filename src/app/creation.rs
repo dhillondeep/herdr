@@ -235,7 +235,13 @@ impl App {
         initial_cwd: PathBuf,
         focus: bool,
     ) -> std::io::Result<usize> {
-        self.create_workspace_with_launch_env(initial_cwd, focus, Vec::new())
+        self.create_workspace_with_launch_env(
+            initial_cwd,
+            focus,
+            Vec::new(),
+            #[cfg(unix)]
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -254,20 +260,49 @@ impl App {
         initial_cwd: PathBuf,
         focus: bool,
         extra_env: Vec<(String, String)>,
+        // Taken here rather than applied afterwards. The root pane is spawned as part
+        // of building the workspace, so a host attached later arrives after that pane
+        // already has a local shell — which is exactly what "created on box1, opened a
+        // local shell" looks like.
+        #[cfg(unix)] host: Option<crate::host::HostId>,
     ) -> std::io::Result<usize> {
         let (rows, cols) = self.state.estimate_pane_size();
-        let (ws, terminal, runtime) = Workspace::new_with_extra_env(
+
+        // Resolved before the shell config borrows state, and connecting here is
+        // deliberate: the alternative is a root pane that silently runs somewhere the
+        // user did not choose.
+        #[cfg(unix)]
+        let link = host.as_ref().and_then(|host| self.host_link(host));
+
+        // `mut` only where a host can be attached; on Windows there is no remote path
+        // and the binding would be a needless-mut warning.
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut shell_config =
+            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode);
+        #[cfg(unix)]
+        if let Some(link) = link.as_ref() {
+            shell_config = shell_config.on_host(link);
+        }
+
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let (mut ws, terminal, runtime) = Workspace::new_with_extra_env(
             initial_cwd,
             rows,
             cols,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
-            crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            shell_config,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
             extra_env,
         )?;
+        // Only when the pane really did land there. Marking a workspace remote whose
+        // root pane fell back to a local shell would misreport where the work is.
+        #[cfg(unix)]
+        if link.is_some() {
+            ws.set_host(host);
+        }
         self.terminal_runtimes.insert(terminal.id.clone(), runtime);
         self.state.terminals.insert(terminal.id.clone(), terminal);
         self.state.workspaces.push(ws);

@@ -366,6 +366,14 @@ const MAX_QUEUED_FRAMES_PER_CHANNEL: usize = 64;
 /// So readers only ever enqueue, and one writer drains round-robin.
 struct Outbox {
     inner: Mutex<OutboxInner>,
+    /// The socket itself, behind its OWN lock.
+    ///
+    /// Separate from the queue on purpose, and the separation is the whole point: a
+    /// client whose socket buffer has filled blocks the writer mid-write, and if that
+    /// happened under the queue lock then every reader enqueuing, every new client
+    /// attaching, and every detach would block behind it — the daemon stops answering
+    /// anyone, permanently, and each new connection just adds another stuck process.
+    sink: Mutex<Option<Box<dyn Write + Send>>>,
     /// Signals the writer that there is work, or that it should stop.
     ready: std::sync::Condvar,
     /// Signals waiters that everything queued has been written.
@@ -373,10 +381,20 @@ struct Outbox {
 }
 
 struct OutboxInner {
-    /// `None` while nobody is attached. Output produced then is dropped here rather
-    /// than queued: the log holds it, and buffering for an absent client without
-    /// bound is how a daemon gets OOM-killed.
-    writer: Option<Box<dyn Write + Send>>,
+    /// Whether a client is attached. Output produced when none is is dropped rather
+    /// than queued: the log holds it, and buffering for an absent client without bound
+    /// is how a daemon gets OOM-killed.
+    ///
+    /// A flag rather than the writer itself, so asking "is anyone there" never waits
+    /// behind a socket write.
+    attached: bool,
+    /// Bumped every time a client attaches or detaches.
+    ///
+    /// The writer takes the socket OUT while it writes, so a detach that happens
+    /// meanwhile finds nothing to drop. The generation is how it knows, on finishing,
+    /// whether the socket it holds still belongs to the current client — restoring a
+    /// stale one would hand the next client the previous client's connection.
+    generation: u64,
     /// Frames belonging to no channel — the handshake, exec answers. Never dropped.
     control: std::collections::VecDeque<FromHost>,
     /// Per channel, in order. Ordered map so the round-robin is deterministic.
@@ -393,8 +411,10 @@ struct OutboxInner {
 impl Outbox {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            sink: Mutex::new(None),
             inner: Mutex::new(OutboxInner {
-                writer: None,
+                attached: false,
+                generation: 0,
                 control: std::collections::VecDeque::new(),
                 channels: std::collections::BTreeMap::new(),
                 cursor: 0,
@@ -417,7 +437,7 @@ impl Outbox {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        while inner.writer.is_some() && (!inner.control.is_empty() || inner.has_channel_work()) {
+        while inner.attached && (!inner.control.is_empty() || inner.has_channel_work()) {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return;
             };
@@ -429,8 +449,12 @@ impl Outbox {
     }
 
     fn install(&self, writer: Box<dyn Write + Send>) {
+        if let Ok(mut sink) = self.sink.lock() {
+            *sink = Some(writer);
+        }
         if let Ok(mut inner) = self.inner.lock() {
-            inner.writer = Some(writer);
+            inner.attached = true;
+            inner.generation += 1;
         }
         self.ready.notify_all();
     }
@@ -443,10 +467,20 @@ impl Outbox {
     /// exist to prevent.
     fn detach(&self) {
         if let Ok(mut inner) = self.inner.lock() {
-            inner.writer = None;
+            inner.attached = false;
+            inner.generation += 1;
             inner.control.clear();
             inner.channels.clear();
         }
+        // `try_lock`, never `lock`. The writer holds this while it is blocked inside a
+        // write to a client that stopped reading — which is precisely the case this
+        // function has to survive. Failing to take it is fine: the socket is in the
+        // writer's hands, and the generation bump above means it will be dropped rather
+        // than restored when that write finally returns.
+        if let Ok(mut sink) = self.sink.try_lock() {
+            *sink = None;
+        }
+        self.drained.notify_all();
     }
 
     fn shutdown(&self) {
@@ -492,7 +526,7 @@ fn frame_channel(message: &FromHost) -> Option<ChannelId> {
 /// holds up the readers that are enqueuing.
 fn run_outbox(out: SharedOut) {
     loop {
-        let (batch, writer_present) = {
+        let batch = {
             let Ok(mut inner) = out.inner.lock() else {
                 return;
             };
@@ -500,8 +534,7 @@ fn run_outbox(out: SharedOut) {
                 if inner.stop {
                     return;
                 }
-                if inner.writer.is_some() && (!inner.control.is_empty() || inner.has_channel_work())
-                {
+                if inner.attached && (!inner.control.is_empty() || inner.has_channel_work()) {
                     break;
                 }
                 let Ok(next) = out.ready.wait(inner) else {
@@ -509,35 +542,64 @@ fn run_outbox(out: SharedOut) {
                 };
                 inner = next;
             }
-            (inner.take_batch(), true)
+            inner.take_batch()
         };
-        if !writer_present || batch.is_empty() {
+        if batch.is_empty() {
             continue;
         }
 
+        // The socket is TAKEN OUT and written to holding no lock at all. A client that
+        // has stopped reading blocks this for as long as it likes; if anything else had
+        // to wait on it — a reader enqueuing, a new client attaching, a detach — the
+        // daemon would stop answering anyone, permanently, and every later connection
+        // would just add another stuck process. That is not hypothetical: it is what a
+        // half-dead ssh peer did to a real host.
+        let (mut writer, generation) = {
+            let Ok(mut sink) = out.sink.lock() else {
+                return;
+            };
+            let Ok(inner) = out.inner.lock() else {
+                return;
+            };
+            match sink.take() {
+                Some(writer) => (writer, inner.generation),
+                // Detached while this batch was in flight; the frames belong to a client
+                // that is gone.
+                None => continue,
+            }
+        };
+
         let mut failed = false;
+        for message in &batch {
+            if write_frame(&mut writer, message).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        if !failed && writer.flush().is_err() {
+            failed = true;
+        }
+
         {
             let Ok(mut inner) = out.inner.lock() else {
                 return;
             };
-            if let Some(writer) = inner.writer.as_mut() {
-                for message in &batch {
-                    if write_frame(writer, message).is_err() {
-                        failed = true;
-                        break;
-                    }
+            // Only give it back if it is still the current client's socket. A detach or
+            // a new attach while the write was in flight means this one is stale, and
+            // restoring it would hand the next client the previous one's connection.
+            let still_current = inner.generation == generation && !failed;
+            if still_current {
+                if let Ok(mut sink) = out.sink.lock() {
+                    *sink = Some(writer);
                 }
-                if !failed && writer.flush().is_err() {
-                    failed = true;
-                }
-            }
-            if failed {
-                // The client vanished mid-write. Detach so later output is discarded
-                // cheaply instead of retrying into a dead pipe on every frame.
-                inner.writer = None;
+            } else if failed && inner.generation == generation {
+                inner.attached = false;
                 inner.control.clear();
                 inner.channels.clear();
             }
+        }
+
+        if let Ok(inner) = out.inner.lock() {
             if inner.control.is_empty() && !inner.has_channel_work() {
                 out.drained.notify_all();
             }
@@ -1238,7 +1300,7 @@ fn send(out: &SharedOut, message: &FromHost) {
     let Ok(mut inner) = out.inner.lock() else {
         return;
     };
-    if inner.writer.is_none() {
+    if !inner.attached {
         // Nobody attached. Dropping is deliberate — the log holds it, and queueing for
         // an absent client without bound is how a daemon gets OOM-killed.
         return;
@@ -1681,6 +1743,76 @@ mod output_log_tests {
             seen
         )
         .is_some());
+    }
+
+    /// A writer that blocks until released, standing in for a client that has stopped
+    /// reading — the state a half-dead ssh peer leaves behind.
+    struct BlockingWriter(std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Write for BlockingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let (lock, cv) = &*self.0;
+            let mut released = lock.lock().unwrap_or_else(|err| err.into_inner());
+            while !*released {
+                released = cv.wait(released).unwrap_or_else(|err| err.into_inner());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_does_not_wedge_the_whole_daemon() {
+        // This is what actually happened on a real host: a client's socket filled, the
+        // writer blocked mid-write, and because that write held the queue lock nothing
+        // could enqueue, attach or detach ever again. Every later connection hung and
+        // left another stuck process behind; only killing the daemon recovered it.
+        //
+        // So the property is narrow and absolute: while a write is blocked, the rest of
+        // the outbox must still be usable.
+        let out = Outbox::new();
+        {
+            let out = Arc::clone(&out);
+            std::thread::spawn(move || run_outbox(out));
+        }
+
+        let gate = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        out.install(Box::new(BlockingWriter(std::sync::Arc::clone(&gate))));
+        send(&out, &data(1, 0, 8));
+
+        // Give the writer time to pick the frame up and block inside `write`.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Everything below must complete rather than block behind that write.
+        let worker = {
+            let out = Arc::clone(&out);
+            std::thread::spawn(move || {
+                send(&out, &data(2, 0, 8));
+                out.detach();
+                out.install(Box::new(std::io::sink()));
+                send(&out, &data(3, 0, 8));
+            })
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the outbox wedged behind a blocked client write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        worker.join().expect("worker");
+
+        // Release the stuck write so the thread can retire.
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        out.shutdown();
     }
 
     #[test]

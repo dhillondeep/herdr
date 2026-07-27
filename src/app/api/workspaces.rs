@@ -63,13 +63,19 @@ impl App {
                 }
             },
         };
-        match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
+        match self.create_workspace_with_launch_env(
+            cwd,
+            params.focus,
+            extra_env,
+            #[cfg(unix)]
+            host.clone(),
+        ) {
             Ok(index) => {
                 if let Some(host) = host {
+                    // The workspace already carries the host when its root pane landed
+                    // there; this covers the case where it did not, and is a no-op
+                    // otherwise since the setter ignores an unchanged value.
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
-                        // Through the setter: it discards git state read on the old
-                        // machine, which for a workspace that has just moved describes
-                        // the wrong repository entirely.
                         workspace.set_host(Some(host.clone()));
                     }
                     // Start connecting now rather than when the first pane needs
