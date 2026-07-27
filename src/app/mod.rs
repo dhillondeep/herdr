@@ -870,12 +870,7 @@ impl App {
 
         // Warm the host list off-thread so the workspace picker never waits on a
         // discovery command.
-        if host_discovery_enabled(no_session) {
-            let host_discovery_tx = event_tx.clone();
-            std::thread::spawn(move || {
-                crate::host::sources::discover_in_background(host_discovery_tx)
-            });
-        }
+        let discover_at_startup = host_discovery_enabled(no_session);
 
         let last_focus = state.active.and_then(|idx| {
             state
@@ -884,7 +879,7 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
-        Self {
+        let app = Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
@@ -940,7 +935,23 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
+        };
+        if discover_at_startup {
+            app.start_host_discovery();
         }
+        app
+    }
+
+    /// Populate the host list in the background.
+    ///
+    /// Callable more than once on purpose. Discovery shells out — an ssh config read
+    /// and a workspace-manager command — and any of that can fail transiently at boot,
+    /// before the network is up or a VPN has connected. Running it only at startup means
+    /// one bad moment leaves the workspace picker permanently offering nowhere to go,
+    /// with no way to retry short of killing the server.
+    fn start_host_discovery(&self) {
+        let events = self.event_tx.clone();
+        std::thread::spawn(move || crate::host::sources::discover_in_background(events));
     }
 
     #[cfg(unix)]
@@ -980,6 +991,14 @@ impl App {
         }
         if background_update_check_enabled(app.no_session, app.update_manifest_check_enabled) {
             app.next_agent_manifest_update_check = Some(now + AUTO_UPDATE_CHECK_INTERVAL);
+        }
+        // A handed-off server is a fresh process with a restored session, and it needs
+        // the host list as much as a cold start does. Leaving it out meant the workspace
+        // picker silently offered no machines after every update or restart-with-handoff
+        // — and since discovery only ran at startup, it stayed that way until the server
+        // was killed outright.
+        if host_discovery_enabled(app.no_session) {
+            app.start_host_discovery();
         }
         app.state.detach_exits = false;
         app.state.pane_id_aliases = pane_id_aliases;

@@ -100,6 +100,13 @@ impl App {
                     .or_else(|| self.seed_cwd_from_workspace(ws_idx))
             });
             let cwd = self.resolve_new_terminal_cwd(follow_cwd);
+            // Retry discovery when there is nothing to offer. Getting an empty picker
+            // is exactly the moment the host list turns out to be wrong, and without
+            // this the only cure is restarting the server.
+            #[cfg(unix)]
+            if self.state.host_candidates.is_empty() {
+                self.start_host_discovery();
+            }
             super::input::open_new_workspace_dialog(&mut self.state, cwd);
             return;
         }
