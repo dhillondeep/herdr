@@ -20,7 +20,7 @@ pub use crate::protocol::wire::FramingError;
 /// per machine and may lag, so compatibility is a *range* rather than equality —
 /// see [`negotiate`]. Exact-match versioning here would mean one stale host
 /// bricks that host until re-provisioned.
-pub const HOST_PROTOCOL_VERSION: u32 = 5;
+pub const HOST_PROTOCOL_VERSION: u32 = 6;
 
 /// Oldest host protocol this build can still talk to.
 ///
@@ -31,7 +31,7 @@ pub const HOST_PROTOCOL_VERSION: u32 = 5;
 /// binary reports a clear version mismatch telling the user to re-provision, which
 /// `herdr host install` makes a one-liner. Once the message set settles this stops
 /// moving and the range starts doing real work.
-pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 5;
+pub const MIN_SUPPORTED_HOST_PROTOCOL_VERSION: u32 = 6;
 
 /// Cap on a single host frame. Output is chunked well below this; the cap exists
 /// so a corrupted length prefix cannot make us allocate wildly.
@@ -106,6 +106,19 @@ pub enum ToHost {
         argv: Vec<String>,
         cwd: Option<String>,
     },
+    /// Run agent detection for this channel on the host, matching `agent`.
+    ///
+    /// The host has the same binary and the same bundled manifests, but it does not
+    /// know *which* agent a pane is running: identity comes from the local process
+    /// probe, not from the screen. So the local side names it, and the host matches
+    /// against it.
+    ///
+    /// `agent: None` turns host detection off for the channel, which is also what a
+    /// pane whose agent went away needs.
+    Detect {
+        channel: ChannelId,
+        agent: Option<String>,
+    },
     /// Reconnecting: here is the epoch I last saw and how far I had read on each
     /// pane. Tell me, per pane, whether I can resume.
     ///
@@ -115,6 +128,28 @@ pub enum ToHost {
         host_epoch: u64,
         panes: Vec<(ChannelId, u64)>,
     },
+}
+
+/// Agent state as it travels between machines.
+///
+/// A wire copy of the internal enum rather than the enum itself: the protocol is a
+/// contract between separately-provisioned binaries, and letting an internal type
+/// define it means an unrelated refactor silently changes what two versions agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectedState {
+    Idle,
+    Working,
+    Blocked,
+    Unknown,
+}
+
+/// Blocker kind as it travels between machines. Same reasoning as [`DetectedState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectedBlocker {
+    Permission,
+    Question,
+    Selection,
+    Unknown,
 }
 
 /// Why a pane the client remembered is no longer available.
@@ -216,6 +251,16 @@ pub enum FromHost {
         code: Option<i32>,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+    },
+    /// The host's own detection result for a channel, sent only when it changes.
+    ///
+    /// On change rather than on a timer because the point is to spend less, not to move
+    /// the same spend onto the wire.
+    Detected {
+        channel: ChannelId,
+        state: DetectedState,
+        blocker: DetectedBlocker,
+        fault: bool,
     },
     /// The pane no longer exists.
     Gone {

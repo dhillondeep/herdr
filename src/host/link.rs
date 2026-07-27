@@ -201,6 +201,20 @@ struct Shared {
     /// The process behind the live transport, so closing the link can unblock a
     /// reader that is parked on it.
     child: Mutex<Option<std::process::Child>>,
+    /// The host's latest detection per channel, if it is doing the detecting.
+    ///
+    /// Last-value-wins rather than a queue: only the current state matters, and a
+    /// backlog of stale states would be read long after they stopped being true.
+    detected: Mutex<
+        HashMap<
+            ChannelId,
+            (
+                crate::host::protocol::DetectedState,
+                crate::host::protocol::DetectedBlocker,
+                bool,
+            ),
+        >,
+    >,
     /// Callers waiting on an `Exec`, by request id.
     ///
     /// A map rather than a channel per call so a dead transport can fail every waiter
@@ -575,6 +589,7 @@ impl HostLink {
             closing: AtomicBool::new(false),
             fatal: AtomicBool::new(false),
             child: Mutex::new(None),
+            detected: Mutex::new(HashMap::new()),
             execs: Mutex::new(HashMap::new()),
             next_exec_id: AtomicU64::new(1),
             pending_shutdown: Mutex::new(Vec::new()),
@@ -666,6 +681,56 @@ impl HostLink {
                 Err(std::io::Error::other("no answer from the host"))
             }
         }
+    }
+
+    /// Ask the host to run detection for a channel, matching `agent`.
+    ///
+    /// `None` turns it off, which is what a pane whose agent went away needs — leaving
+    /// it on would keep reporting state for something that is no longer there.
+    pub fn watch_detection(&self, channel: ChannelId, agent: Option<&str>) {
+        let _ = self.shared.wire.send(&ToHost::Detect {
+            channel,
+            agent: agent.map(str::to_string),
+        });
+        if agent.is_none() {
+            self.shared
+                .detected
+                .lock()
+                .ok()
+                .map(|mut map| map.remove(&channel));
+        }
+    }
+
+    /// The host's latest detection for a channel, if it is doing the detecting.
+    ///
+    /// Sticky rather than draining: the host reports only on change, so the last value
+    /// remains the current one until it says otherwise.
+    pub fn host_detection(
+        &self,
+        channel: ChannelId,
+    ) -> Option<(crate::detect::AgentState, crate::detect::BlockerKind, bool)> {
+        use crate::host::protocol::{DetectedBlocker, DetectedState};
+        let (state, blocker, fault) = self
+            .shared
+            .detected
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&channel).copied())?;
+        Some((
+            match state {
+                DetectedState::Idle => crate::detect::AgentState::Idle,
+                DetectedState::Working => crate::detect::AgentState::Working,
+                DetectedState::Blocked => crate::detect::AgentState::Blocked,
+                DetectedState::Unknown => crate::detect::AgentState::Unknown,
+            },
+            match blocker {
+                DetectedBlocker::Permission => crate::detect::BlockerKind::Permission,
+                DetectedBlocker::Question => crate::detect::BlockerKind::Question,
+                DetectedBlocker::Selection => crate::detect::BlockerKind::Selection,
+                DetectedBlocker::Unknown => crate::detect::BlockerKind::Unknown,
+            },
+            fault,
+        ))
     }
 
     /// Why a channel ended, if the host said.
@@ -1133,6 +1198,16 @@ fn dispatch_from_host(
                 // forever. Shutdown reaches every handle at once, giving the actor
                 // the same EOF a local PTY produces when its child dies.
                 close_channel(&shared.channels, channel);
+            }
+            FromHost::Detected {
+                channel,
+                state,
+                blocker,
+                fault,
+            } => {
+                if let Ok(mut map) = shared.detected.lock() {
+                    map.insert(channel, (state, blocker, fault));
+                }
             }
             FromHost::ExecResult {
                 id,

@@ -645,6 +645,7 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_basic_detection_task(
     pane_id: PaneId,
     child_pid: LocalPid,
@@ -652,6 +653,12 @@ fn spawn_basic_detection_task(
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     state_events: mpsc::Sender<AppEvent>,
+    // Set for a remote pane, so matching can happen on the machine the output is
+    // already on instead of on this one.
+    #[cfg(unix)] remote: Option<(
+        std::sync::Arc<crate::host::link::HostLink>,
+        crate::host::protocol::ChannelId,
+    )>,
 ) -> (
     tokio::task::AbortHandle,
     Arc<Notify>,
@@ -892,13 +899,56 @@ fn spawn_basic_detection_task(
 
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
-            let Some(screen_detection) = detection_update_for_publish_with_osc(
-                agent,
-                &content,
-                &osc_title,
-                &osc_progress,
-                process_exited,
-            ) else {
+
+            // Tell the host which agent to match, whenever that changes. Its answers
+            // are only meaningful against the right agent, and identity is resolved
+            // here from the process, not from the screen.
+            #[cfg(unix)]
+            if agent_changed {
+                if let Some((link, channel)) = remote.as_ref() {
+                    link.watch_detection(*channel, agent.map(crate::detect::agent_label));
+                }
+            }
+
+            // If the host is already matching this pane, take its answer instead of
+            // running the same manifest pass here. The screen read above still happens,
+            // because agent acquisition depends on noticing content change; what moves
+            // to the other machine is the matching, which is the part that costs.
+            //
+            // A finished process is excluded: the host may not have noticed yet, and
+            // local knowledge that it exited is better than a stale remote state.
+            #[cfg(unix)]
+            let pushed = (!process_exited)
+                .then(|| {
+                    remote
+                        .as_ref()
+                        .and_then(|(link, channel)| link.host_detection(*channel))
+                })
+                .flatten();
+            #[cfg(not(unix))]
+            let pushed: Option<(AgentState, crate::detect::BlockerKind, bool)> = None;
+
+            let publishable = match pushed {
+                Some((state, blocker, fault)) => Some(crate::detect::AgentDetection {
+                    state,
+                    // The host already refuses to report from a transcript view, so
+                    // anything that arrives here is live state.
+                    skip_state_update: false,
+                    visible_idle: state == AgentState::Idle,
+                    visible_blocker: state == AgentState::Blocked,
+                    visible_working: state == AgentState::Working,
+                    fault,
+                    blocker,
+                }),
+                None => detection_update_for_publish_with_osc(
+                    agent,
+                    &content,
+                    &osc_title,
+                    &osc_progress,
+                    process_exited,
+                ),
+            };
+            let Some(screen_detection) = publishable else {
                 pending_idle.clear();
                 continue;
             };
@@ -2215,6 +2265,12 @@ impl PaneRuntime {
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
             events,
+            #[cfg(unix)]
+            match &io_kind {
+                ImportedIo::Remote { link, channel } => Some((Arc::clone(link), *channel)),
+                // A local handoff has no host to ask.
+                ImportedIo::LocalHandoff { .. } => None,
+            },
         );
 
         Ok(Self {
@@ -2671,6 +2727,7 @@ impl PaneRuntime {
 
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
+
                     let Some(screen_detection) = detection_update_for_publish_with_osc(
                         agent,
                         &content,

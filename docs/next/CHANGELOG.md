@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Agent detection for remote panes runs on the host, against the screen shadow it already keeps, and is reported only when the state changes. The manifest matching moves to the machine the output is already on; the local side still reads its own screen, because agent acquisition depends on noticing content change.
 - Output to a remote host is written by one thread draining per-pane queues round-robin, so a pane producing faster than the client reads can no longer stall the other panes on that host. A pane that outruns the client loses its oldest queued output, which the client marks and the next reconnect replays from the log.
 - Remote panes keep output that no longer fits in memory in a per-channel disk spool, so a reconnect after a longer absence replays exactly instead of falling back to a screen snapshot. 32 MiB per pane by default; set `HERDR_PTY_HOST_SPOOL_BYTES=0` to keep terminal output off the host's disk entirely.
 - Remote workspaces now report their git branch and ahead/behind counts, read on the machine the repository is actually on. Previously they reported nothing, because running git locally for a remote workspace describes a different repository whenever the path happens to exist here too.

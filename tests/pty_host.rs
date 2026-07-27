@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 mod protocol {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 5;
+    pub const HOST_PROTOCOL_VERSION: u32 = 6;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -57,6 +57,11 @@ mod protocol {
             id: u64,
             argv: Vec<String>,
             cwd: Option<String>,
+        },
+        #[allow(dead_code)]
+        Detect {
+            channel: u64,
+            agent: Option<String>,
         },
     }
 

@@ -88,6 +88,14 @@ struct OutputLog {
     /// Bytes that fell out of the memory ring, kept on disk so a longer absence can
     /// still be replayed exactly instead of resolving to a snapshot.
     ///
+    /// Which agent the host should match when detecting on this channel.
+    ///
+    /// Beside the screen and under the same lock, because a detection is only
+    /// meaningful paired with the screen it was read from — separating them would let
+    /// an agent change land between the read and the match.
+    detect_agent: Option<crate::detect::Agent>,
+    /// The last result sent, so only changes go on the wire.
+    last_detected: Option<(crate::detect::AgentState, crate::detect::BlockerKind, bool)>,
     /// `None` when spooling is off or has failed. Losing it is always survivable: the
     /// client gets a `Desync` or a snapshot, which is what it would have got anyway.
     spool: Option<Spool>,
@@ -235,6 +243,8 @@ impl OutputLog {
             // it from its first byte.
             ready: true,
             screen: None,
+            detect_agent: None,
+            last_detected: None,
             spool: None,
         }
     }
@@ -470,6 +480,7 @@ fn frame_channel(message: &FromHost) -> Option<ChannelId> {
         | FromHost::Replay { channel, .. }
         | FromHost::Snapshot { channel, .. }
         | FromHost::Desync { channel, .. }
+        | FromHost::Detected { channel, .. }
         | FromHost::Gone { channel, .. } => Some(*channel),
         FromHost::Welcome { .. } | FromHost::ExecResult { .. } => None,
     }
@@ -600,6 +611,12 @@ impl Daemon {
         }
         let channels: Arc<Mutex<HashMap<ChannelId, Channel>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        // Detection for whichever channels the client asks the host to watch.
+        {
+            let out = Arc::clone(&out);
+            let channels = Arc::clone(&channels);
+            std::thread::spawn(move || run_host_detection(channels, out));
+        }
 
         // Exits are reported from reader threads; a channel keeps that off the
         // request path so a wedged reader cannot stall input handling.
@@ -793,6 +810,19 @@ fn handle(
             }
         }
         ToHost::Shutdown { channel } => shutdown_channel(channels, channel),
+        ToHost::Detect { channel, agent } => {
+            let log = channels
+                .lock()
+                .ok()
+                .and_then(|map| map.get(&channel).map(|entry| Arc::clone(&entry.log)));
+            if let Some(log) = log {
+                let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+                log.detect_agent = agent.as_deref().and_then(crate::detect::parse_agent_label);
+                // Forget the previous result so the next scan reports whatever the new
+                // agent sees, rather than suppressing it as unchanged.
+                log.last_detected = None;
+            }
+        }
         ToHost::Exec { id, argv, cwd } => {
             // On a thread: the read loop is what carries every pane's input, and a git
             // command on a cold repository can take seconds. Blocking here would stall
@@ -893,6 +923,118 @@ fn answer_attach(
     };
     send(out, &answer);
     log.ready = true;
+}
+
+/// How often the host re-reads its shadow screens looking for a state change.
+///
+/// Matches the local cadence it replaces. Faster would spend more to learn the same
+/// thing; slower would make a pane look busy after it stopped.
+const HOST_DETECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Watch every channel that has been asked for, and report state changes.
+///
+/// One thread for the whole daemon rather than one per channel: the work is a short
+/// screen read and a regex pass, and a thread per pane would cost more in scheduling
+/// than the matching does.
+fn run_host_detection(channels: Arc<Mutex<HashMap<ChannelId, Channel>>>, out: SharedOut) {
+    loop {
+        std::thread::sleep(HOST_DETECT_INTERVAL);
+
+        let logs: Vec<(ChannelId, Arc<Mutex<OutputLog>>)> = match channels.lock() {
+            Ok(map) => map
+                .iter()
+                .map(|(channel, entry)| (*channel, Arc::clone(&entry.log)))
+                .collect(),
+            Err(_) => return,
+        };
+        if logs.is_empty() {
+            continue;
+        }
+
+        for (channel, log) in logs {
+            let mut log = log.lock().unwrap_or_else(|err| err.into_inner());
+            let Some(agent) = log.detect_agent else {
+                continue;
+            };
+            let Some(screen) = log.screen.as_ref() else {
+                continue;
+            };
+            let Some(text) = visible_screen_text(screen) else {
+                continue;
+            };
+
+            let detection = crate::detect::detect_agent(Some(agent), &text);
+            let Some(current) = detection_worth_reporting(&detection, log.last_detected) else {
+                continue;
+            };
+            log.last_detected = Some(current);
+            drop(log);
+
+            send(
+                &out,
+                &FromHost::Detected {
+                    channel,
+                    state: wire_state(current.0),
+                    blocker: wire_blocker(current.1),
+                    fault: current.2,
+                },
+            );
+        }
+    }
+}
+
+/// Whether a detection should go on the wire, and what to remember if so.
+///
+/// Two reasons to stay quiet, and they are different. A screen the agent has marked
+/// skippable is a transcript viewer or a pager — not live state — and reporting from it
+/// would overwrite what the agent is actually doing with whatever the user happens to be
+/// scrolled to. An unchanged result is simply not news, and sending it anyway would move
+/// the cost onto the wire rather than removing it, which is the opposite of the point.
+fn detection_worth_reporting(
+    detection: &crate::detect::AgentDetection,
+    last: Option<(crate::detect::AgentState, crate::detect::BlockerKind, bool)>,
+) -> Option<(crate::detect::AgentState, crate::detect::BlockerKind, bool)> {
+    if detection.skip_state_update {
+        return None;
+    }
+    let current = (detection.state, detection.blocker, detection.fault);
+    (last != Some(current)).then_some(current)
+}
+
+/// The shadow screen as plain text, which is what detection matches against.
+fn visible_screen_text(terminal: &crate::ghostty::Terminal) -> Option<String> {
+    let rows = terminal.rows().ok()?;
+    let cols = terminal.cols().ok()?;
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    terminal
+        .read_text_viewport(
+            (0, 0),
+            (cols.saturating_sub(1), u32::from(rows.saturating_sub(1))),
+            true,
+        )
+        .ok()
+}
+
+fn wire_state(state: crate::detect::AgentState) -> crate::host::protocol::DetectedState {
+    use crate::host::protocol::DetectedState;
+    match state {
+        crate::detect::AgentState::Idle => DetectedState::Idle,
+        crate::detect::AgentState::Working => DetectedState::Working,
+        crate::detect::AgentState::Blocked => DetectedState::Blocked,
+        crate::detect::AgentState::Unknown => DetectedState::Unknown,
+    }
+}
+
+fn wire_blocker(blocker: crate::detect::BlockerKind) -> crate::host::protocol::DetectedBlocker {
+    use crate::host::protocol::DetectedBlocker;
+    match blocker {
+        crate::detect::BlockerKind::Permission => DetectedBlocker::Permission,
+        crate::detect::BlockerKind::Question => DetectedBlocker::Question,
+        crate::detect::BlockerKind::Selection => DetectedBlocker::Selection,
+        crate::detect::BlockerKind::Unknown => DetectedBlocker::Unknown,
+    }
 }
 
 /// Run one command and describe what happened, without ever failing to answer.
@@ -1490,6 +1632,55 @@ mod output_log_tests {
         let out = Outbox::new();
         out.install(Box::new(std::io::sink()));
         out
+    }
+
+    fn detection(state: crate::detect::AgentState, skip: bool) -> crate::detect::AgentDetection {
+        crate::detect::AgentDetection {
+            state,
+            skip_state_update: skip,
+            visible_idle: false,
+            visible_blocker: false,
+            visible_working: false,
+            fault: false,
+            blocker: crate::detect::BlockerKind::Unknown,
+        }
+    }
+
+    #[test]
+    fn a_transcript_view_is_never_reported_as_live_state() {
+        // Scrolling back through history is not the agent doing something. Reporting
+        // from it would replace what the agent is actually doing with whatever the user
+        // happens to be looking at — and on the host there is no second signal to
+        // correct it with.
+        assert_eq!(
+            detection_worth_reporting(&detection(crate::detect::AgentState::Idle, true), None),
+            None
+        );
+        // The same screen without the skip flag IS news.
+        assert!(detection_worth_reporting(
+            &detection(crate::detect::AgentState::Idle, false),
+            None
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn only_a_change_is_worth_sending() {
+        // Otherwise this moves the cost onto the wire instead of removing it.
+        let current = detection(crate::detect::AgentState::Working, false);
+        let seen = Some((
+            crate::detect::AgentState::Working,
+            crate::detect::BlockerKind::Unknown,
+            false,
+        ));
+        assert_eq!(detection_worth_reporting(&current, seen), None);
+        assert!(detection_worth_reporting(&current, None).is_some());
+        // A different state is a change even when everything else matches.
+        assert!(detection_worth_reporting(
+            &detection(crate::detect::AgentState::Idle, false),
+            seen
+        )
+        .is_some());
     }
 
     #[test]

@@ -115,6 +115,11 @@ mod client {
             argv: Vec<String>,
             cwd: Option<String>,
         },
+        #[allow(dead_code)]
+        Detect {
+            channel: u64,
+            agent: Option<String>,
+        },
         // Present only to keep the variant tags aligned with the real protocol.
         // bincode encodes an enum discriminant positionally, so a shim that omits a
         // variant silently renumbers every one after it and this whole test file
@@ -177,6 +182,13 @@ mod client {
             stderr: Vec<u8>,
         },
         #[allow(dead_code)]
+        Detected {
+            channel: u64,
+            state: u8,
+            blocker: u8,
+            fault: bool,
+        },
+        #[allow(dead_code)]
         Gone {
             channel: u64,
             reason: u8,
@@ -222,7 +234,7 @@ impl Bridge {
     fn spawn(argv: &[&str], rows: u16, cols: u16) -> Self {
         let (daemon, mut stdout, mut stdin) = Daemon::start();
 
-        client::write(&mut stdin, &ToHost::Hello { version: 5 }).expect("hello");
+        client::write(&mut stdin, &ToHost::Hello { version: 6 }).expect("hello");
         let welcome: FromHost = client::read(&mut stdout).expect("welcome");
         assert!(matches!(welcome, FromHost::Welcome { .. }));
 

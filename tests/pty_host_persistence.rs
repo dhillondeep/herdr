@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 mod client {
     use serde::{Deserialize, Serialize};
 
-    pub const HOST_PROTOCOL_VERSION: u32 = 5;
+    pub const HOST_PROTOCOL_VERSION: u32 = 6;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct SpawnSpec {
@@ -57,6 +57,11 @@ mod client {
             id: u64,
             argv: Vec<String>,
             cwd: Option<String>,
+        },
+        #[allow(dead_code)]
+        Detect {
+            channel: u64,
+            agent: Option<String>,
         },
         Attach {
             host_epoch: u64,
@@ -114,6 +119,13 @@ mod client {
             code: Option<i32>,
             stdout: Vec<u8>,
             stderr: Vec<u8>,
+        },
+        #[allow(dead_code)]
+        Detected {
+            channel: u64,
+            state: u8,
+            blocker: u8,
+            fault: bool,
         },
         Gone {
             channel: u64,
@@ -341,6 +353,120 @@ fn the_attach_bridge_delivers_the_handshake_without_waiting_for_the_stream_to_en
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
+fn the_host_detects_agent_state_and_reports_only_changes() {
+    // Detection moves to the machine the output is already on. The host has the same
+    // binary and manifests but does not know WHICH agent a pane is running — identity
+    // comes from the local process probe — so the client names it and the host matches.
+    let socket = scratch("host-detect");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    // A pane that paints something Claude-shaped and then sits there.
+    client::write(
+        &mut stream,
+        &ToHost::Spawn {
+            channel: 1,
+            spec: SpawnSpec {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'esc to interrupt\n'; sleep 30".to_string(),
+                ],
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+            },
+        },
+    )
+    .expect("spawn");
+    match client::read::<_, FromHost>(&mut stream).expect("spawned") {
+        FromHost::Spawned { .. } => {}
+        other => panic!("expected Spawned, got {other:?}"),
+    }
+
+    client::write(
+        &mut stream,
+        &ToHost::Detect {
+            channel: 1,
+            agent: Some("claude".to_string()),
+        },
+    )
+    .expect("detect");
+
+    // Bounded reads throughout: without them the quiet-window check below blocks until
+    // the pane's own process ends, turning a two-second assertion into a thirty-second
+    // test.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .expect("read timeout");
+
+    // Something must arrive, and it must be a Detected rather than the client having to
+    // work the state out from the bytes itself.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut detected = None;
+    while Instant::now() < deadline && detected.is_none() {
+        match client::read::<_, FromHost>(&mut stream) {
+            Ok(FromHost::Detected { channel, state, .. }) => detected = Some((channel, state)),
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let (channel, _state) = detected.expect("the host should report a detection");
+    assert_eq!(channel, 1);
+
+    // And it reports on change only: a screen that stops moving stops producing
+    // reports, or this would be the same cost moved onto the wire.
+    let quiet_until = Instant::now() + Duration::from_secs(2);
+    let mut repeats = 0;
+    while Instant::now() < quiet_until {
+        match client::read::<_, FromHost>(&mut stream) {
+            Ok(FromHost::Detected { .. }) => repeats += 1,
+            // A timeout here is the expected outcome, not a failure: it means the host
+            // had nothing new to say.
+            Ok(_) | Err(_) => continue,
+        }
+    }
+    assert!(
+        repeats <= 1,
+        "an unchanged screen should not keep reporting; got {repeats} extra"
+    );
+}
+
+#[test]
+fn turning_host_detection_off_stops_it() {
+    // A pane whose agent went away must stop being reported on, or the host keeps
+    // asserting state for something that is no longer there.
+    let socket = scratch("host-detect-off");
+    let daemon = Daemon::start(socket.clone());
+    let mut stream = daemon.connect();
+
+    client::write(
+        &mut stream,
+        &ToHost::Detect {
+            channel: 99,
+            agent: None,
+        },
+    )
+    .expect("detect off");
+
+    // No channel 99 exists; this must be a no-op rather than a panic or a stall.
+    client::write(
+        &mut stream,
+        &ToHost::Exec {
+            id: 1,
+            argv: vec!["printf".into(), "alive".into()],
+            cwd: None,
+        },
+    )
+    .expect("exec");
+    match client::read::<_, FromHost>(&mut stream).expect("result") {
+        FromHost::ExecResult { stdout, .. } => assert_eq!(stdout, b"alive"),
+        other => panic!("daemon should still be serving, got {other:?}"),
+    }
 }
 
 #[test]
