@@ -195,6 +195,9 @@ pub struct App {
     pub(crate) next_animation_tick: Option<Instant>,
     pub(crate) next_auto_update_check: Option<Instant>,
     pub(crate) next_agent_manifest_update_check: Option<Instant>,
+    /// When to look for hosts again. `None` means as soon as possible.
+    #[cfg(unix)]
+    pub(crate) next_host_discovery: Option<Instant>,
     pub(crate) update_version_check_enabled: bool,
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
@@ -935,6 +938,8 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
+            #[cfg(unix)]
+            next_host_discovery: None,
         };
         if discover_at_startup {
             app.start_host_discovery();

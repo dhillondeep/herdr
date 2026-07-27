@@ -343,6 +343,8 @@ impl App {
         changed |= self.clear_due_selection_highlight(now);
 
         self.start_git_status_refresh_if_due(now);
+        #[cfg(unix)]
+        self.start_host_discovery_if_due(now);
 
         if self
             .next_auto_update_check
@@ -568,6 +570,27 @@ impl App {
 
         let manifest_update_tx = self.event_tx.clone();
         std::thread::spawn(move || crate::detect::manifest_update::auto_update(manifest_update_tx));
+    }
+
+    /// Re-discover hosts periodically.
+    ///
+    /// Discovery needs the network and a valid workspace-manager login, neither of which
+    /// is guaranteed at server start — and the server outlives both by days. Running it
+    /// only at startup meant one bad moment produced a list with no remote machines in
+    /// it that stayed that way, indistinguishable from genuinely having none.
+    #[cfg(unix)]
+    pub(crate) fn start_host_discovery_if_due(&mut self, now: Instant) {
+        const HOST_DISCOVERY_REFRESH_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(60);
+
+        if self
+            .next_host_discovery
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        self.next_host_discovery = Some(now + HOST_DISCOVERY_REFRESH_INTERVAL);
+        self.start_host_discovery();
     }
 
     pub(crate) fn start_git_status_refresh_if_due(&mut self, now: Instant) {

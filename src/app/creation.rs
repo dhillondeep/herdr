@@ -94,13 +94,16 @@ impl App {
     }
 
     pub(super) fn begin_tui_workspace_create(&mut self, request_id: &'static str) {
-        // Retry discovery when there is nothing to offer. Getting an empty picker is
-        // exactly the moment the host list turns out to be wrong, and without this the
-        // only cure is restarting the server.
+        // Refresh the host list every time, not only when it is empty. Emptiness is the
+        // wrong trigger: a stale list usually still has the ssh-config entries in it, so
+        // the half that actually failed — the workspace-manager command, which needs the
+        // network and a valid login — is invisible. Checking for empty meant a list
+        // missing every remote machine looked healthy.
+        //
+        // Asynchronous, so it does not delay this dialog; it is the next open that
+        // benefits, together with the periodic refresh.
         #[cfg(unix)]
-        if self.state.host_candidates.is_empty() {
-            self.start_host_discovery();
-        }
+        self.start_host_discovery();
 
         // Two different questions, and they were wrongly treated as one. Naming a
         // workspace is a preference that defaults to OFF; choosing which machine it
